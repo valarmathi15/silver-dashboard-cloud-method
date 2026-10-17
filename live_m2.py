@@ -5,7 +5,7 @@ ONE single file - no m.py needed. The Method 2 engine is copied inside (same log
 so the live numbers match the backtest dashboard.
 
 What it does every refresh
-  1. pulls candles from Zerodha Kite Connect (API key)       -> fetch_candles()
+  1. pulls candles from Angel One SmartAPI       -> fetch_candles()
   2. drops the candle that is still forming (only CLOSED candles are used)
   3. runs M2 from your chosen start date (cloud is still computed on the warm-up history)
   4. shows: current lots / avg price / unrealised %, last signal (BUY / EXIT / HOLD),
@@ -13,7 +13,7 @@ What it does every refresh
   5. optional phone push through ntfy when a NEW BUY or EXIT appears on a closed candle
 
 Run   :  python -m streamlit run live_m2.py
-API key / secret : typed on the first screen (no Streamlit secrets needed)
+Login details (API key, Client ID, MPIN, TOTP secret): typed on the first screen - no Streamlit secrets needed
 """
 import datetime as dt
 import json
@@ -112,11 +112,11 @@ def run_m2(df, profit_target_pct, max_lots, start_date=None, lot_qty=1.0, trace=
     return pd.DataFrame(trades)
 
 
-# timeframe -> (Kite interval, raw bar length, warm-up calendar days needed for the cloud)
+# timeframe -> (Angel interval, raw bar length, warm-up calendar days needed for the cloud)
 TF = {
-    '1D': ('day',      pd.Timedelta(days=1),   260),
-    '4H': ('60minute', pd.Timedelta(hours=1),  160),   # 4H = 4 hourly bars, built per day
-    '1H': ('60minute', pd.Timedelta(hours=1),  100),
+    '1D': ('ONE_DAY',  pd.Timedelta(days=1),   260),
+    '4H': ('ONE_HOUR', pd.Timedelta(hours=1),  160),   # 4H = 4 hourly bars, built per day
+    '1H': ('ONE_HOUR', pd.Timedelta(hours=1),  100),
 }
 STATE_FILE = os.path.join(HERE, 'last_signal.json')
 
@@ -128,39 +128,57 @@ def secret(name, default=''):
         return os.environ.get(name, default)
 
 
-# =============================================================== DATA FEED (only this part is broker specific)
-def kite_client(api_key, access_token):
-    from kiteconnect import KiteConnect
-    k = KiteConnect(api_key=api_key)
-    k.set_access_token(access_token)
-    return k
+# =============================================================== DATA FEED (Angel One SmartAPI)
+SCRIP_URL = 'https://margincalculator.angelbroking.com/OpenAPI_File/files/OpenAPIScripMaster.json'
 
 
-@st.cache_data(ttl=86400, show_spinner=False)
-def _instrument_token(_kite, api_key, exchange, symbol):
-    for r in _kite.instruments(exchange):
-        if r['tradingsymbol'].upper() == symbol.strip().upper():
-            return r['instrument_token']
-    raise ValueError(f'{symbol} not found on {exchange}')
+def angel_login(client_id, api_key, mpin, totp_secret):
+    """Login with Client ID + MPIN + TOTP (the 6-digit code is generated from your TOTP secret)."""
+    import pyotp
+    from SmartApi import SmartConnect
+    smart = SmartConnect(api_key=api_key)
+    res = smart.generateSession(client_id, mpin, pyotp.TOTP(totp_secret.replace(' ', '')).now())
+    if not res or not res.get('status'):
+        raise ValueError((res or {}).get('message', 'login failed'))
+    return smart
 
 
-def fetch_candles(kite, api_key, exchange, symbol, tf, start_date):
+@st.cache_data(ttl=86400, show_spinner='Loading Angel One instrument list ...')
+def _scrip_master():
+    return requests.get(SCRIP_URL, timeout=120).json()
+
+
+def _instrument_token(exchange, symbol):
+    sym = symbol.strip().upper()
+    hits = [r for r in _scrip_master() if r['exch_seg'] == exchange
+            and r['symbol'].upper() in (sym, sym + '-EQ')]
+    if not hits:
+        raise ValueError(f'{symbol} not found on {exchange}  (equity: SBIN-EQ / index: Nifty 50 / MCX: GOLDM05DEC25FUT)')
+    hits.sort(key=lambda r: r['symbol'].upper() != sym)          # exact match first
+    return hits[0]['token']
+
+
+def fetch_candles(smart, exchange, symbol, tf, start_date):
     """-> raw candles (Date, Open, High, Low, Close), tz-naive IST, oldest first."""
     interval, _, warm_days = TF[tf]
-    token = _instrument_token(kite, api_key, exchange, symbol)
+    token = _instrument_token(exchange, symbol)
     frm = pd.Timestamp(start_date) - pd.Timedelta(days=warm_days)
     to = pd.Timestamp.now()
-    step = pd.Timedelta(days=1900 if interval == 'day' else 190)   # Kite per-request limits
+    step = pd.Timedelta(days=1900 if interval == 'ONE_DAY' else 190)   # Angel per-request limits
     rows, cur = [], frm
     while cur < to:
         end = min(cur + step, to)
-        rows += kite.historical_data(token, cur.to_pydatetime(), end.to_pydatetime(), interval)
-        cur = end + pd.Timedelta(seconds=1)
-        time.sleep(0.4)                                            # Kite: max ~3 requests/sec
+        res = smart.getCandleData({'exchange': exchange, 'symboltoken': token, 'interval': interval,
+                                   'fromdate': cur.strftime('%Y-%m-%d %H:%M'),
+                                   'todate': end.strftime('%Y-%m-%d %H:%M')})
+        if not res or not res.get('status'):
+            raise ValueError((res or {}).get('message', 'candle request failed'))
+        rows += res.get('data') or []
+        cur = end + pd.Timedelta(minutes=1)
+        time.sleep(0.5)                                                # Angel: ~3 requests/sec
     if not rows:
         raise ValueError('no candles returned')
-    df = pd.DataFrame(rows).rename(columns={'date': 'Date', 'open': 'Open', 'high': 'High',
-                                            'low': 'Low', 'close': 'Close'})
+    df = pd.DataFrame(rows, columns=['Date', 'Open', 'High', 'Low', 'Close', 'Volume'])
     df['Date'] = pd.to_datetime(df['Date'])
     if df['Date'].dt.tz is not None:
         df['Date'] = df['Date'].dt.tz_localize(None)
@@ -235,29 +253,18 @@ def notify_new_signal(topic, key, last_row):
                 st.warning(f'ntfy failed: {e}')
 
 
-# =============================================================== login (Kite access token is valid for 1 day)
-def get_kite(api_key, api_secret):
-    """Login with the keys typed on screen. Token is kept only in THIS browser session."""
-    token = st.session_state.get('kite_token', '')
-    if token:
-        try:
-            k = kite_client(api_key, token)
-            k.profile()
-            return k
-        except Exception:
-            st.session_state['kite_token'] = ''
-    from kiteconnect import KiteConnect
-    kc = KiteConnect(api_key=api_key)
-    st.markdown(f'1) [Login to Zerodha]({kc.login_url()})   2) copy `request_token` from the redirected URL   3) paste below')
-    rt = st.text_input('request_token')
-    if rt:
-        try:
-            sess = kc.generate_session(rt.strip(), api_secret=api_secret)
-            st.session_state['kite_token'] = sess['access_token']
-            st.rerun()
-        except Exception as e:
-            st.error(f'Login failed: {e}')
-    return None
+# =============================================================== login
+def get_smart():
+    """Logged-in SmartConnect for THIS browser session (re-logs in automatically if it expired)."""
+    c = st.session_state['creds']
+    if 'smart' not in st.session_state:
+        st.session_state['smart'] = angel_login(c['client_id'], c['api_key'], c['mpin'], c['totp'])
+    return st.session_state['smart']
+
+
+def relogin():
+    st.session_state.pop('smart', None)
+    return get_smart()
 
 
 # =============================================================== UI
@@ -265,26 +272,35 @@ def main():
     st.set_page_config(page_title='Live Method 2', layout='wide')
     st.title('Live Method 2 - Cloud Scale-In')
 
-    # ---- STEP 1: ask for the API key + secret on screen (nothing is stored on the server)
-    if not st.session_state.get('keys_ok'):
-        st.subheader('Enter your Kite API details')
-        k_in = st.text_input('API key', type='password')
-        s_in = st.text_input('API secret', type='password')
-        if st.button('Continue') and k_in and s_in:
-            st.session_state['api_key'], st.session_state['api_secret'] = k_in.strip(), s_in.strip()
-            st.session_state['keys_ok'] = True
-            st.rerun()
+    # ---- STEP 1: ask for Angel One details on screen (nothing is stored on the server)
+    if 'creds' not in st.session_state:
+        st.subheader('Enter your Angel One details')
+        api_key = st.text_input('API key', type='password')
+        client_id = st.text_input('Client ID')
+        mpin = st.text_input('MPIN', type='password')
+        totp = st.text_input('TOTP secret key', type='password',
+                             help='The long text shown when you enable TOTP (not the 6-digit code)')
+        if st.button('Login') and api_key and client_id and mpin and totp:
+            creds = {'api_key': api_key.strip(), 'client_id': client_id.strip().upper(),
+                     'mpin': mpin.strip(), 'totp': totp.strip()}
+            try:
+                st.session_state['creds'] = creds
+                get_smart()
+                st.rerun()
+            except Exception as e:
+                st.session_state.pop('creds', None)
+                st.session_state.pop('smart', None)
+                st.error(f'Login failed: {e}')
         return
-    api_key, api_secret = st.session_state['api_key'], st.session_state['api_secret']
 
     with st.sidebar:
-        if st.button('Change API key / logout'):
-            for k_ in ('keys_ok', 'api_key', 'api_secret', 'kite_token'):
+        if st.button('Logout / change details'):
+            for k_ in ('creds', 'smart'):
                 st.session_state.pop(k_, None)
             st.rerun()
         exchange = st.selectbox('Exchange', ['NSE', 'MCX', 'NFO', 'BSE'])
-        symbol = st.text_input('Trading symbol', 'NIFTY 50',
-                               help='Kite tradingsymbol, e.g. NIFTY 50, RELIANCE, GOLDM26DECFUT')
+        symbol = st.text_input('Trading symbol', 'Nifty 50',
+                               help='Index: Nifty 50  |  Stock: RELIANCE (or RELIANCE-EQ)  |  MCX: exact future symbol, e.g. GOLDM05DEC25FUT')
         tf = st.selectbox('Timeframe', list(TF))
         profit = st.number_input('Profit target %', 0.5, 50.0, 1.0, 0.5)
         lots = st.number_input('Max lots', 1, 500, 10, 1)
@@ -294,20 +310,20 @@ def main():
         refresh = st.number_input('Refresh every (seconds)', 15, 3600, 60, 15)
         topic = st.text_input('ntfy topic (optional)')
 
-    kite = get_kite(api_key, api_secret)
-    if kite is None:
-        return
-
     @st.cache_data(ttl=30, show_spinner=False)
-    def load(_k, key_, ex, sym, tf_, start_):
-        return fetch_candles(_k, api_key, ex, sym, tf_, start_)
+    def load(_smart, client_id, ex, sym, tf_, start_):
+        return fetch_candles(_smart, ex, sym, tf_, start_)
 
     def render():
+        cid = st.session_state['creds']['client_id']
         try:
-            raw = load(kite, api_key, exchange, symbol, tf, start)
-        except Exception as e:
-            st.error(f'Data error: {e}')
-            return
+            raw = load(get_smart(), cid, exchange, symbol, tf, start)
+        except Exception:
+            try:                                   # session may have expired -> login again once
+                raw = load(relogin(), cid, exchange, symbol, tf, start)
+            except Exception as e:
+                st.error(f'Data error: {e}')
+                return
         now = pd.Timestamp.now()
         df = prepare(raw, tf, close_t, now)
         tr, trades = compute_m2(df, profit, int(lots), start)
