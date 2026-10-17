@@ -1,8 +1,8 @@
 """
 live_m2.py  -  LIVE Method 2 (Cloud Scale-In, Google-sheet logic)
 =================================================================
-Same engine as the dashboard: it calls m.run_cloud_backtest(..., method='M2') from m.py
-(m.py is NOT changed), so the live numbers always match the backtest dashboard.
+ONE single file - no m.py needed. The Method 2 engine is copied inside (same logic as m.py),
+so the live numbers match the backtest dashboard.
 
 What it does every refresh
   1. pulls candles from Zerodha Kite Connect (API key)       -> fetch_candles()
@@ -12,16 +12,12 @@ What it does every refresh
      the bar-by-bar log and the trade list
   5. optional phone push through ntfy when a NEW BUY or EXIT appears on a closed candle
 
-Run   :  python -m streamlit run live_m2.py        (keep m.py in the same folder)
-Secrets (.streamlit/secrets.toml  or  environment variables)
-    KITE_API_KEY    = "xxxx"
-    KITE_API_SECRET = "xxxx"
-    NTFY_TOPIC      = "your-topic"        # optional
+Run   :  python -m streamlit run live_m2.py
+API key / secret : typed on the first screen (no Streamlit secrets needed)
 """
 import datetime as dt
 import json
 import os
-import sys
 import time
 
 import numpy as np
@@ -30,8 +26,91 @@ import requests
 import streamlit as st
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-sys.path.insert(0, HERE)
-import m as engine  # your engine file (unchanged)
+
+# =============================================================== ENGINE (M2 only, copied from m.py - same logic)
+TENKAN_P, KIJUN_P, SENKOU_B_P, DISPLACEMENT = 9, 26, 52, 26
+
+
+def add_ichimoku_cloud(df):
+    df = df.copy()
+    high, low = df['High'], df['Low']
+    tenkan = (high.rolling(TENKAN_P).max() + low.rolling(TENKAN_P).min()) / 2
+    kijun = (high.rolling(KIJUN_P).max() + low.rolling(KIJUN_P).min()) / 2
+    df['SenkouA'] = ((tenkan + kijun) / 2).shift(DISPLACEMENT)
+    df['SenkouB'] = ((high.rolling(SENKOU_B_P).max() + low.rolling(SENKOU_B_P).min()) / 2).shift(DISPLACEMENT)
+    df['CloudTop'] = df[['SenkouA', 'SenkouB']].max(axis=1, skipna=False)
+    df['CloudBottom'] = df[['SenkouA', 'SenkouB']].min(axis=1, skipna=False)
+    df['AboveCloud'] = df['Close'] > df['CloudTop']
+    return df
+
+
+def run_m2(df, profit_target_pct, max_lots, start_date=None, lot_qty=1.0, trace=None):
+    """Method 2 (Google-sheet logic). Returns trades DataFrame; trace (list) gets one dict per bar."""
+    full = add_ichimoku_cloud(df)
+    if start_date is not None:   # cloud uses full history, simulation starts flat from start_date
+        full = full[full['Date'] >= pd.Timestamp(start_date)].reset_index(drop=True)
+    rows = full.to_dict('records')
+
+    trades = []
+    trade_id = 0
+    m2_first, m2_lots, m2_avg, m2_prev_exit, m2_seg_start = True, 0, None, False, None
+
+    for row in rows:
+        if pd.isna(row['CloudTop']) or pd.isna(row['CloudBottom']):
+            continue
+        price, date = row['Close'], row['Date']
+        above = bool(row['AboveCloud'])
+        if m2_first:
+            m2_first = False
+            m2_lots = 1 if above else 0
+            m2_avg = price if m2_lots == 1 else None
+        else:
+            prev_lots = m2_lots
+            if not above:
+                pass
+            elif m2_prev_exit:
+                m2_lots = 1
+            elif m2_lots < max_lots:
+                m2_lots += 1
+            if m2_lots == 1:
+                m2_avg = price
+            elif m2_lots > prev_lots:
+                m2_avg = (m2_avg * prev_lots + price) / m2_lots
+        m2_prev_exit = False
+        if m2_seg_start is None and m2_lots > 0:
+            m2_seg_start = date
+        if m2_lots > 0 and m2_avg:
+            if (price - m2_avg) / m2_avg >= profit_target_pct / 100.0:
+                trade_id += 1
+                trades.append({
+                    'Trade ID': trade_id, 'Entry Date (1st lot)': m2_seg_start, 'Exit Date': date,
+                    'Holding Days': (date - m2_seg_start).days, 'Lots Filled': m2_lots,
+                    'Max Lots Allowed': max_lots, 'Avg Entry Price': round(m2_avg, 4),
+                    'Exit Price': round(price, 4),
+                    'Profit % (on avg entry)': round((price - m2_avg) / m2_avg * 100, 2),
+                    'PnL (pts x qty)': round((price - m2_avg) * m2_lots * lot_qty, 2),
+                    'Exit Reason': f'Profit target {profit_target_pct}% hit (Method 2 - sheet logic)'})
+                m2_prev_exit = True
+                m2_seg_start = None
+        if trace is not None:
+            trace.append({'Date': date, 'Close': price, 'CloudTop': row['CloudTop'],
+                          'CloudBottom': row['CloudBottom'], 'Above': above, 'Lots': m2_lots,
+                          'AvgPrice': None if not m2_avg else round(m2_avg, 4),
+                          'Action': 'EXIT' if m2_prev_exit else ''})
+
+    if m2_lots > 0 and m2_avg and not m2_prev_exit and m2_seg_start is not None and rows:
+        price, date = full.iloc[-1]['Close'], full.iloc[-1]['Date']
+        trade_id += 1
+        trades.append({
+            'Trade ID': trade_id, 'Entry Date (1st lot)': m2_seg_start, 'Exit Date': date,
+            'Holding Days': (date - m2_seg_start).days, 'Lots Filled': m2_lots,
+            'Max Lots Allowed': max_lots, 'Avg Entry Price': round(m2_avg, 4),
+            'Exit Price': round(price, 4),
+            'Profit % (on avg entry)': round((price - m2_avg) / m2_avg * 100, 2),
+            'PnL (pts x qty)': round((price - m2_avg) * m2_lots * lot_qty, 2),
+            'Exit Reason': 'Open at end of data (marked to last close)'})
+    return pd.DataFrame(trades)
+
 
 # timeframe -> (Kite interval, raw bar length, warm-up calendar days needed for the cloud)
 TF = {
@@ -39,7 +118,6 @@ TF = {
     '4H': ('60minute', pd.Timedelta(hours=1),  160),   # 4H = 4 hourly bars, built per day
     '1H': ('60minute', pd.Timedelta(hours=1),  100),
 }
-TOKEN_FILE = os.path.join(HERE, 'kite_token.json')
 STATE_FILE = os.path.join(HERE, 'last_signal.json')
 
 
@@ -121,8 +199,7 @@ def prepare(raw, tf, close_t, now):
 # =============================================================== M2 live state (engine reused as-is)
 def compute_m2(df, profit_pct, max_lots, start_date):
     trace = []
-    trades = engine.run_cloud_backtest(df, profit_pct, max_lots, start_date=start_date,
-                                       method='M2', trace=trace)
+    trades = run_m2(df, profit_pct, max_lots, start_date=start_date, trace=trace)
     tr = pd.DataFrame(trace)
     if tr.empty:
         return tr, trades
@@ -160,30 +237,23 @@ def notify_new_signal(topic, key, last_row):
 
 # =============================================================== login (Kite access token is valid for 1 day)
 def get_kite(api_key, api_secret):
-    token = secret('KITE_ACCESS_TOKEN') or st.session_state.get('kite_token', '')
-    if not token and os.path.exists(TOKEN_FILE):
-        with open(TOKEN_FILE) as f:
-            d = json.load(f)
-        if d.get('date') == str(dt.date.today()):
-            token = d['token']
+    """Login with the keys typed on screen. Token is kept only in THIS browser session."""
+    token = st.session_state.get('kite_token', '')
     if token:
         try:
             k = kite_client(api_key, token)
             k.profile()
             return k
         except Exception:
-            token = ''
+            st.session_state['kite_token'] = ''
     from kiteconnect import KiteConnect
     kc = KiteConnect(api_key=api_key)
-    st.warning('Kite login needed (once per day).')
     st.markdown(f'1) [Login to Zerodha]({kc.login_url()})   2) copy `request_token` from the redirected URL   3) paste below')
     rt = st.text_input('request_token')
-    if rt and api_secret:
+    if rt:
         try:
             sess = kc.generate_session(rt.strip(), api_secret=api_secret)
             st.session_state['kite_token'] = sess['access_token']
-            with open(TOKEN_FILE, 'w') as f:
-                json.dump({'date': str(dt.date.today()), 'token': sess['access_token']}, f)
             st.rerun()
         except Exception as e:
             st.error(f'Login failed: {e}')
@@ -195,12 +265,23 @@ def main():
     st.set_page_config(page_title='Live Method 2', layout='wide')
     st.title('Live Method 2 - Cloud Scale-In')
 
-    api_key, api_secret = secret('KITE_API_KEY'), secret('KITE_API_SECRET')
-    if not api_key:
-        st.error('KITE_API_KEY not set (secrets.toml / environment).')
+    # ---- STEP 1: ask for the API key + secret on screen (nothing is stored on the server)
+    if not st.session_state.get('keys_ok'):
+        st.subheader('Enter your Kite API details')
+        k_in = st.text_input('API key', type='password')
+        s_in = st.text_input('API secret', type='password')
+        if st.button('Continue') and k_in and s_in:
+            st.session_state['api_key'], st.session_state['api_secret'] = k_in.strip(), s_in.strip()
+            st.session_state['keys_ok'] = True
+            st.rerun()
         return
+    api_key, api_secret = st.session_state['api_key'], st.session_state['api_secret']
 
     with st.sidebar:
+        if st.button('Change API key / logout'):
+            for k_ in ('keys_ok', 'api_key', 'api_secret', 'kite_token'):
+                st.session_state.pop(k_, None)
+            st.rerun()
         exchange = st.selectbox('Exchange', ['NSE', 'MCX', 'NFO', 'BSE'])
         symbol = st.text_input('Trading symbol', 'NIFTY 50',
                                help='Kite tradingsymbol, e.g. NIFTY 50, RELIANCE, GOLDM26DECFUT')
@@ -211,19 +292,19 @@ def main():
         default_close = dt.time(23, 30) if exchange == 'MCX' else dt.time(15, 30)
         close_t = st.time_input('Market close', default_close)
         refresh = st.number_input('Refresh every (seconds)', 15, 3600, 60, 15)
-        topic = st.text_input('ntfy topic (optional)', secret('NTFY_TOPIC'))
+        topic = st.text_input('ntfy topic (optional)')
 
     kite = get_kite(api_key, api_secret)
     if kite is None:
         return
 
     @st.cache_data(ttl=30, show_spinner=False)
-    def load(_k, ex, sym, tf_, start_):
+    def load(_k, key_, ex, sym, tf_, start_):
         return fetch_candles(_k, api_key, ex, sym, tf_, start_)
 
     def render():
         try:
-            raw = load(kite, exchange, symbol, tf, start)
+            raw = load(kite, api_key, exchange, symbol, tf, start)
         except Exception as e:
             st.error(f'Data error: {e}')
             return
