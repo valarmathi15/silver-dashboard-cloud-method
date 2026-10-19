@@ -377,6 +377,47 @@ def checkbox_dropdown(title, options, default, key, fmt=str):
     return chosen
 
 
+NIFTY50_STOCKS = ['ADANIENT', 'ADANIPORTS', 'APOLLOHOSP', 'ASIANPAINT', 'AXISBANK', 'BAJAJ-AUTO', 'BAJFINANCE',
+                  'BAJAJFINSV', 'BEL', 'BHARTIARTL', 'CIPLA', 'COALINDIA', 'DRREDDY', 'EICHERMOT', 'ETERNAL',
+                  'GRASIM', 'HCLTECH', 'HDFCBANK', 'HDFCLIFE', 'HINDALCO', 'HINDUNILVR', 'ICICIBANK', 'INDIGO',
+                  'INFY', 'ITC', 'JIOFIN', 'JSWSTEEL', 'KOTAKBANK', 'LT', 'M&M', 'MARUTI', 'NESTLEIND', 'NTPC',
+                  'ONGC', 'POWERGRID', 'RELIANCE', 'SBILIFE', 'SBIN', 'SHRIRAMFIN', 'SUNPHARMA', 'TATACONSUMER',
+                  'TATAMOTORS', 'TATASTEEL', 'TCS', 'TECHM', 'TITAN', 'TRENT', 'ULTRACEMCO', 'WIPRO']
+
+
+@st.cache_data(ttl=86400, show_spinner='Loading instrument list ...')
+def instrument_choices(exchange):
+    """{'Index': [...], 'Stocks': [...], 'Commodity': [...]} for the drop-downs (built from Angel's instrument list)."""
+    try:
+        master = _scrip_master()
+    except Exception:
+        return {}
+    rows = [r for r in master if r.get('exch_seg') == exchange]
+    out = {}
+    idx = sorted({r['symbol'] for r in rows if r.get('instrumenttype') == 'AMXIDX'})
+    if idx:
+        out['Index'] = idx
+    if exchange == 'NSE':
+        eq = {r['symbol'] for r in rows if r['symbol'].endswith('-EQ')}
+        st_ = [x for x in NIFTY50_STOCKS if x + '-EQ' in eq]
+        if st_:
+            out['Stocks'] = st_
+    if exchange == 'MCX':
+        today, best = dt.datetime.now(), {}
+        for r in rows:
+            if r.get('instrumenttype') != 'FUTCOM':
+                continue
+            try:
+                exp = dt.datetime.strptime(r['expiry'], '%d%b%Y')
+            except Exception:
+                continue
+            if exp.date() >= today.date() and (r['name'] not in best or exp < best[r['name']][0]):
+                best[r['name']] = (exp, r['symbol'])
+        if best:
+            out['Commodity'] = [v[1] for k, v in sorted(best.items())]      # nearest-expiry future of each commodity
+    return out
+
+
 def page_builder():
     st.subheader('Strategy builder - Method 2')
     st.caption('Paper trading. Every Symbol x Max lots x Target % you pick is saved as its own file inside the folder.')
@@ -393,8 +434,13 @@ def page_builder():
     tf = c3.selectbox('Candle timeframe', list(TF))
 
     st.markdown('**Entry condition**  - Ichimoku cloud, Method 2')
-    symbols_txt = st.text_input('Symbols (comma separated)', 'Nifty 50',
-                                help='Index: Nifty 50  |  Stock: RELIANCE (or RELIANCE-EQ)  |  MCX: exact future symbol, e.g. GOLDM05DEC25FUT')
+    picked = []
+    for label, opts in instrument_choices(exchange).items():
+        st.caption(f'{label} ({len(opts)})')
+        picked += checkbox_dropdown(f'Select {label.lower()}', opts, [], f'sym_{exchange}_{label}')
+    typed_txt = st.text_input('Or type names (comma separated)', placeholder='e.g. Nifty 50, RELIANCE, GOLDM05DEC25FUT',
+                              help='Index: Nifty 50  |  Stock: RELIANCE (or RELIANCE-EQ)  |  MCX: exact future symbol. '
+                                   'Typed names are added to the ticked ones.')
     c1, c2 = st.columns(2)
     with c1:
         st.caption('Max lots (one file each)')
@@ -412,15 +458,19 @@ def page_builder():
     else:
         start = pd.Timestamp.now().strftime('%Y-%m-%d %H:%M')
 
-    symbols = [x.strip() for x in symbols_txt.split(',') if x.strip()]
+    symbols, seen = [], set()
+    for x in picked + [t.strip() for t in typed_txt.split(',') if t.strip()]:
+        if x.upper() not in seen:
+            seen.add(x.upper())
+            symbols.append(x)
     n = len(symbols) * len(lots_list) * len(targets)
-    st.caption(f'{n} file(s) will be saved.  Start = {start}  ({"first candle that closes after this" if start_mode == "Now" else "backfilled from that date"})')
+    st.caption(f'{len(symbols)} symbol(s) x {len(lots_list)} lots x {len(targets)} targets = {n} file(s) will be saved.  Start = {start}  ({"first candle that closes after this" if start_mode == "Now" else "backfilled from that date"})')
     st.caption('Live trading (real orders) is not included - run Paper first and check the numbers.')
     if st.button('Start', type='primary'):
         if not folder or not folder.strip():
             st.error('Give a folder name.')
         elif n == 0:
-            st.error('Pick at least one symbol, one Max lots and one Target %.')
+            st.error('Pick (or type) at least one symbol, one Max lots and one Target %.')
         elif n > 60:
             st.error('Too many files (max 60 at a time).')
         else:
