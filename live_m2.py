@@ -356,6 +356,27 @@ def money(x):
 
 
 # =============================================================== pages
+def checkbox_dropdown(title, options, default, key, fmt=str):
+    """Drop-down with a check box beside every option + Select all. Returns the ticked options."""
+    base = f'cb_{key}'
+    for o in options:
+        if f'{base}_{o}' not in st.session_state:
+            st.session_state[f'{base}_{o}'] = o in default
+
+    def _toggle_all():
+        v = st.session_state[f'{base}__all']
+        for o in options:
+            st.session_state[f'{base}_{o}'] = v
+
+    chosen = [o for o in options if st.session_state[f'{base}_{o}']]
+    st.session_state[f'{base}__all'] = len(chosen) == len(options)
+    with st.popover(f'{title} · {len(chosen)} selected', width='stretch'):
+        st.checkbox('Select all', key=f'{base}__all', on_change=_toggle_all)
+        for o in options:
+            st.checkbox(fmt(o), key=f'{base}_{o}')
+    return chosen
+
+
 def page_builder():
     st.subheader('Strategy builder - Method 2')
     st.caption('Paper trading. Every Symbol x Max lots x Target % you pick is saved as its own file inside the folder.')
@@ -375,10 +396,13 @@ def page_builder():
     symbols_txt = st.text_input('Symbols (comma separated)', 'Nifty 50',
                                 help='Index: Nifty 50  |  Stock: RELIANCE (or RELIANCE-EQ)  |  MCX: exact future symbol, e.g. GOLDM05DEC25FUT')
     c1, c2 = st.columns(2)
-    lots_list = c1.multiselect('Max lots (one file each)', LOTS_OPTIONS, default=[10])
+    with c1:
+        st.caption('Max lots (one file each)')
+        lots_list = checkbox_dropdown('Select Max lots', LOTS_OPTIONS, [10], 'lots')
     qty = c2.number_input('Quantity per lot', min_value=1.0, value=1.0, step=1.0)
     st.markdown('**Exit condition**')
-    targets = st.multiselect('Target % (one file each)', TARGET_OPTIONS, default=[1, 2])
+    st.caption('Target % (one file each)')
+    targets = checkbox_dropdown('Select Target %', TARGET_OPTIONS, [1, 2], 'targets', fmt=lambda x: f'{x}%')
     c1, c2, c3 = st.columns(3)
     close_t = c1.time_input('Market close', dt.time(23, 30) if exchange == 'MCX' else dt.time(15, 30), key=f'close_{exchange}')
     start_mode = c2.radio('Start from', ['Now', 'Pick date'], horizontal=True)
@@ -490,7 +514,8 @@ def page_view(topic, refresh):
                 st.dataframe(pd.DataFrame(rows), width='stretch', hide_index=True)
             return
 
-        chosen = st.multiselect('Open file(s)', files, default=files[:1], format_func=lambda f: f[:-5])
+        st.caption('Open file(s)')
+        chosen = checkbox_dropdown('Select files', files, files[:1], f'files_{folder}', fmt=lambda f: f[:-5])
         layout = st.radio('Layout', ['Side by side', 'One below another'], horizontal=True) if len(chosen) > 1 else 'One below another'
         cols = st.columns(len(chosen)) if layout == 'Side by side' and len(chosen) > 1 else [st.container() for _ in chosen]
         for col, f in zip(cols, chosen):
