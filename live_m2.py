@@ -1,23 +1,25 @@
 """
-live_m2.py  -  LIVE Method 2 (Cloud Scale-In, Google-sheet logic)
-=================================================================
-ONE single file - no m.py needed. The Method 2 engine is copied inside (same logic as m.py),
-so the live numbers match the backtest dashboard.
+live_m2.py  -  LIVE PAPER TRADING : Method 2 (Cloud Scale-In, Google-sheet logic)   [single file]
+=====================================================================================
+BUILDER   : pick folder, exchange, symbols, candle timeframe, capital, qty, Max lots (many) and
+            Target % (many)  ->  press Start  ->  ONE FILE is saved for every symbol x lots x target
+            (e.g. folder "Nifty test":  Nifty 50 4H 10lots 1%.json,  ... 10lots 2%.json, ...)
+MY STRATEGIES : open a folder -> summary table of all its files, all running live side by side;
+            or open any file(s) to see that strategy's live position, chart, bar log and trades.
 
-What it does every refresh
-  1. pulls candles from Angel One SmartAPI       -> fetch_candles()
-  2. drops the candle that is still forming (only CLOSED candles are used)
-  3. runs M2 from your chosen start date (cloud is still computed on the warm-up history)
-  4. shows: current lots / avg price / unrealised %, last signal (BUY / EXIT / HOLD),
-     the bar-by-bar log and the trade list
-  5. optional phone push through ntfy when a NEW BUY or EXIT appears on a closed candle
+How "live paper" works: Method 2 is fully determined by the candles from the strategy START time,
+so every time you open / refresh, the state is rebuilt from Angel One candles (closed candles only).
+No background process is needed for the numbers. (ntfy push alerts need the app to be open.)
 
-Run   :  python -m streamlit run live_m2.py
-Login details (API key, Client ID, MPIN, TOTP secret): typed on the first screen - no Streamlit secrets needed
+Run : python -m streamlit run live_m2.py
+Login details (API key, Client ID, MPIN, TOTP secret) are typed on the first screen.
+Strategy files are saved in the  strategies/<ClientID>/<folder>/  folder next to this file.
+NOTE: on Streamlit Cloud that folder is wiped when the app reboots - run it on your own PC to keep files.
 """
 import datetime as dt
 import json
 import os
+import re
 import time
 
 import numpy as np
@@ -26,6 +28,18 @@ import requests
 import streamlit as st
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+STRAT_ROOT = os.path.join(HERE, 'strategies')
+STATE_FILE = os.path.join(HERE, 'last_signal.json')
+
+# timeframe -> (Angel interval, raw bar length, warm-up calendar days needed for the cloud)
+TF = {
+    '1D': ('ONE_DAY',  pd.Timedelta(days=1),   260),
+    '4H': ('ONE_HOUR', pd.Timedelta(hours=1),  160),   # 4H = 4 hourly bars, built per day
+    '1H': ('ONE_HOUR', pd.Timedelta(hours=1),  100),
+}
+LOTS_OPTIONS = [10, 20, 30, 40, 50, 60, 70, 80, 90, 100]
+TARGET_OPTIONS = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
+
 
 # =============================================================== ENGINE (M2 only, copied from m.py - same logic)
 TENKAN_P, KIJUN_P, SENKOU_B_P, DISPLACEMENT = 9, 26, 52, 26
@@ -110,22 +124,6 @@ def run_m2(df, profit_target_pct, max_lots, start_date=None, lot_qty=1.0, trace=
             'PnL (pts x qty)': round((price - m2_avg) * m2_lots * lot_qty, 2),
             'Exit Reason': 'Open at end of data (marked to last close)'})
     return pd.DataFrame(trades)
-
-
-# timeframe -> (Angel interval, raw bar length, warm-up calendar days needed for the cloud)
-TF = {
-    '1D': ('ONE_DAY',  pd.Timedelta(days=1),   260),
-    '4H': ('ONE_HOUR', pd.Timedelta(hours=1),  160),   # 4H = 4 hourly bars, built per day
-    '1H': ('ONE_HOUR', pd.Timedelta(hours=1),  100),
-}
-STATE_FILE = os.path.join(HERE, 'last_signal.json')
-
-
-def secret(name, default=''):
-    try:
-        return st.secrets[name]
-    except Exception:
-        return os.environ.get(name, default)
 
 
 # =============================================================== DATA FEED (Angel One SmartAPI)
@@ -214,10 +212,10 @@ def prepare(raw, tf, close_t, now):
     return to_4h(df, close_t) if tf == '4H' else df
 
 
-# =============================================================== M2 live state (engine reused as-is)
-def compute_m2(df, profit_pct, max_lots, start_date):
+# =============================================================== M2 live state
+def compute_m2(df, profit_pct, max_lots, start, qty=1.0):
     trace = []
-    trades = run_m2(df, profit_pct, max_lots, start_date=start_date, trace=trace)
+    trades = run_m2(df, profit_pct, max_lots, start_date=start, lot_qty=qty, trace=trace)
     tr = pd.DataFrame(trace)
     if tr.empty:
         return tr, trades
@@ -253,7 +251,6 @@ def notify_new_signal(topic, key, last_row):
                 st.warning(f'ntfy failed: {e}')
 
 
-# =============================================================== login
 def get_smart():
     """Logged-in SmartConnect for THIS browser session (re-logs in automatically if it expired)."""
     c = st.session_state['creds']
@@ -267,12 +264,253 @@ def relogin():
     return get_smart()
 
 
-# =============================================================== UI
-def main():
-    st.set_page_config(page_title='Live Method 2', layout='wide')
-    st.title('Live Method 2 - Cloud Scale-In')
+# =============================================================== strategy files (folder / file)
+def safe(s):
+    return re.sub(r'[^A-Za-z0-9 _.%\-]', '_', str(s)).strip() or 'x'
 
-    # ---- STEP 1: ask for Angel One details on screen (nothing is stored on the server)
+
+def user_dir():
+    return os.path.join(STRAT_ROOT, safe(st.session_state['creds']['client_id']))
+
+
+def list_folders():
+    d = user_dir()
+    return sorted(f for f in os.listdir(d) if os.path.isdir(os.path.join(d, f))) if os.path.isdir(d) else []
+
+
+def list_files(folder):
+    d = os.path.join(user_dir(), safe(folder))
+    return sorted(f for f in os.listdir(d) if f.endswith('.json')) if os.path.isdir(d) else []
+
+
+def load_strategy(folder, fname):
+    with open(os.path.join(user_dir(), safe(folder), fname), encoding='utf-8') as f:
+        return json.load(f)
+
+
+def delete_strategy(folder, fname):
+    os.remove(os.path.join(user_dir(), safe(folder), fname))
+
+
+def create_strategies(folder, prefix, exchange, symbols, tf, capital, qty, close, lots_list, targets, start):
+    """one file per symbol x lots x target. Existing file is NOT overwritten (keeps its start time)."""
+    d = os.path.join(user_dir(), safe(folder))
+    os.makedirs(d, exist_ok=True)
+    made, skipped = [], []
+    for sym in symbols:
+        for lots in lots_list:
+            for tp in targets:
+                name = f"{prefix + ' ' if prefix else ''}{sym} {tf} {lots}lots {tp}%"
+                path = os.path.join(d, safe(name) + '.json')
+                if os.path.exists(path):
+                    skipped.append(name)
+                    continue
+                s = {'name': name, 'folder': folder, 'mode': 'paper', 'exchange': exchange, 'symbol': sym,
+                     'tf': tf, 'profit': tp, 'lots': lots, 'capital': capital, 'qty': qty, 'close': close,
+                     'start': start, 'created': dt.datetime.now().strftime('%Y-%m-%d %H:%M')}
+                with open(path, 'w', encoding='utf-8') as f:
+                    json.dump(s, f, indent=1)
+                made.append(name)
+    return made, skipped
+
+
+# =============================================================== evaluate one saved strategy
+@st.cache_data(ttl=30, show_spinner=False)
+def _load_candles(_smart, cid, exchange, symbol, tf, start_day):
+    return fetch_candles(_smart, exchange, symbol, tf, start_day)   # same symbol/tf/day => one fetch for all files
+
+
+def get_candles(s):
+    cid = st.session_state['creds']['client_id']
+    day = pd.Timestamp(s['start']).normalize().strftime('%Y-%m-%d')
+    try:
+        return _load_candles(get_smart(), cid, s['exchange'], s['symbol'], s['tf'], day)
+    except Exception:
+        return _load_candles(relogin(), cid, s['exchange'], s['symbol'], s['tf'], day)   # session expired?
+
+
+def evaluate(s):
+    """-> dict with tr (bar log), trades and the numbers shown in the summary."""
+    h, m = [int(x) for x in s['close'].split(':')]
+    raw = get_candles(s)
+    df = prepare(raw, s['tf'], dt.time(h, m), pd.Timestamp.now())
+    tr, trades = compute_m2(df, s['profit'], int(s['lots']), s['start'], s['qty'])
+    out = {'s': s, 'tr': tr, 'trades': trades, 'status': 'Waiting for 1st candle', 'last': None,
+           'closed_n': 0, 'closed_pnl': 0.0, 'open_pnl': 0.0, 'invested': 0.0}
+    if tr.empty:
+        return out
+    last = tr.iloc[-1]
+    flat = last['Signal'] in ('EXIT', 'BUY+EXIT') or int(last['Lots']) == 0 or pd.isna(last['AvgPrice'])
+    openrows = trades[trades['Exit Reason'].str.startswith('Open at end')] if not trades.empty else trades
+    closed = trades.drop(openrows.index) if not trades.empty else trades
+    out.update(last=last, flat=flat, closed_n=len(closed),
+               closed_pnl=float(closed['PnL (pts x qty)'].sum()) if len(closed) else 0.0,
+               open_pnl=0.0 if flat or openrows.empty else float(openrows['PnL (pts x qty)'].sum()),
+               invested=0.0 if flat else float(last['Lots']) * float(last['AvgPrice']) * float(s['qty']),
+               status='Flat' if flat else f"Holding {int(last['Lots'])} lots")
+    return out
+
+
+def money(x):
+    return f"{x:,.0f}"
+
+
+# =============================================================== pages
+def page_builder():
+    st.subheader('Strategy builder - Method 2')
+    st.caption('Paper trading. Every Symbol x Max lots x Target % you pick is saved as its own file inside the folder.')
+    folders = list_folders()
+    c1, c2 = st.columns(2)
+    with c1:
+        pick = st.selectbox('Folder', ['+ New folder'] + folders)
+        folder = st.text_input('New folder name', placeholder='e.g. Nifty 4H test') if pick == '+ New folder' else pick
+    with c2:
+        prefix = st.text_input('File name prefix (optional)', placeholder='e.g. morning')
+    c1, c2, c3 = st.columns(3)
+    exchange = c1.selectbox('Exchange', ['NSE', 'MCX', 'NFO', 'BSE'])
+    capital = c2.number_input('Capital', min_value=0.0, value=1000000.0, step=10000.0)
+    tf = c3.selectbox('Candle timeframe', list(TF))
+
+    st.markdown('**Entry condition**  - Ichimoku cloud, Method 2')
+    symbols_txt = st.text_input('Symbols (comma separated)', 'Nifty 50',
+                                help='Index: Nifty 50  |  Stock: RELIANCE (or RELIANCE-EQ)  |  MCX: exact future symbol, e.g. GOLDM05DEC25FUT')
+    c1, c2 = st.columns(2)
+    lots_list = c1.multiselect('Max lots (one file each)', LOTS_OPTIONS, default=[10])
+    qty = c2.number_input('Quantity per lot', min_value=1.0, value=1.0, step=1.0)
+    st.markdown('**Exit condition**')
+    targets = st.multiselect('Target % (one file each)', TARGET_OPTIONS, default=[1, 2])
+    c1, c2, c3 = st.columns(3)
+    close_t = c1.time_input('Market close', dt.time(23, 30) if exchange == 'MCX' else dt.time(15, 30), key=f'close_{exchange}')
+    start_mode = c2.radio('Start from', ['Now', 'Pick date'], horizontal=True)
+    if start_mode == 'Pick date':
+        d0 = c3.date_input('Start date', dt.date.today() - dt.timedelta(days=30))
+        start = pd.Timestamp(d0).strftime('%Y-%m-%d %H:%M')
+    else:
+        start = pd.Timestamp.now().strftime('%Y-%m-%d %H:%M')
+
+    symbols = [x.strip() for x in symbols_txt.split(',') if x.strip()]
+    n = len(symbols) * len(lots_list) * len(targets)
+    st.caption(f'{n} file(s) will be saved.  Start = {start}  ({"first candle that closes after this" if start_mode == "Now" else "backfilled from that date"})')
+    st.caption('Live trading (real orders) is not included - run Paper first and check the numbers.')
+    if st.button('Start', type='primary'):
+        if not folder or not folder.strip():
+            st.error('Give a folder name.')
+        elif n == 0:
+            st.error('Pick at least one symbol, one Max lots and one Target %.')
+        elif n > 60:
+            st.error('Too many files (max 60 at a time).')
+        else:
+            try:
+                for sym in symbols:
+                    _instrument_token(exchange, sym)          # fail early if a symbol is wrong
+            except Exception as e:
+                st.error(str(e))
+                return
+            made, skipped = create_strategies(folder.strip(), prefix.strip(), exchange, symbols, tf, capital, qty,
+                                              close_t.strftime('%H:%M'), lots_list, targets, start)
+            if made:
+                st.success(f'Saved {len(made)} file(s) in folder "{folder.strip()}". Open "My strategies" to watch them live.')
+            if skipped:
+                st.warning(f'{len(skipped)} file(s) already existed and were kept as they are (their start time is unchanged).')
+
+
+def detail(ev):
+    s, tr, trades, last = ev['s'], ev['tr'], ev['trades'], ev['last']
+    st.markdown(f"#### {s['name']}")
+    st.caption(f"{s['exchange']}:{s['symbol']}  |  {s['tf']}  |  {s['lots']} lots  |  target {s['profit']}%  |  qty/lot {s['qty']:g}"
+               f"  |  capital {money(s['capital'])}  |  started {s['start']}")
+    if last is None:
+        st.info('Waiting for the first closed candle after the start time (cloud needs 78+ bars of history).')
+        return
+    flat = ev['flat']
+    c = st.columns(3)
+    c[0].metric('Last closed bar', str(last['Date'])[:16])
+    c[1].metric('Close', f"{last['Close']:.2f}")
+    c[2].metric('Signal', last['Signal'])
+    c = st.columns(3)
+    c[0].metric('Position', ev['status'])
+    c[1].metric('Avg entry', '-' if flat else f"{last['AvgPrice']:.2f}",
+                None if flat or pd.isna(last['Unrealised %']) else f"{last['Unrealised %']:.2f}%")
+    c[2].metric('Cloud top / bottom', f"{last['CloudTop']:.2f} / {last['CloudBottom']:.2f}")
+    total = ev['closed_pnl'] + ev['open_pnl']
+    c = st.columns(3)
+    c[0].metric('Closed P&L', money(ev['closed_pnl']), f"{ev['closed_n']} trades", delta_color='off')
+    c[1].metric('Open P&L', money(ev['open_pnl']))
+    c[2].metric('Total P&L', money(total), f"{total / s['capital'] * 100:.2f}% of capital" if s['capital'] else None)
+    st.line_chart(tr.tail(150).set_index('Date')[['Close', 'CloudTop', 'CloudBottom']])
+    t1, t2 = st.tabs(['Bar log (latest first)', 'Trades'])
+    with t1:
+        st.dataframe(tr.sort_values('Date', ascending=False).head(100), width='stretch', hide_index=True)
+    with t2:
+        if trades.empty:
+            st.write('No trades yet.')
+        else:
+            st.dataframe(trades.sort_values('Exit Date', ascending=False), width='stretch', hide_index=True)
+
+
+def page_view(topic, refresh):
+    def body():
+        folders = list_folders()
+        if not folders:
+            st.info('No strategies yet. Create some in the Builder.')
+            return
+        folder = st.selectbox('Folder', folders)
+        files = list_files(folder)
+        if not files:
+            st.info('This folder is empty.')
+            return
+        view = st.radio('View', ['Folder summary', 'Open file(s)'], horizontal=True)
+        strategies = [load_strategy(folder, f) for f in files]
+        evs = {}
+        for f, s in zip(files, strategies):
+            try:
+                evs[f] = evaluate(s)
+            except Exception as e:
+                st.error(f"{s['name']}: {e}")
+        for f, ev in evs.items():                                  # push alert on a NEW closed-candle signal
+            if ev['last'] is not None:
+                notify_new_signal(topic, f"{st.session_state['creds']['client_id']}/{folder}/{f}", ev['last'])
+        st.caption(f"Refreshed {dt.datetime.now():%H:%M:%S}  |  closed candles only  |  every {refresh}s")
+
+        if view == 'Folder summary':
+            rows = []
+            for f, ev in evs.items():
+                s, last = ev['s'], ev['last']
+                rows.append({'File': s['name'], 'Status': ev['status'],
+                             'Avg entry': None if last is None or ev['flat'] else float(last['AvgPrice']),
+                             'Close': None if last is None else float(last['Close']),
+                             'Unrealised %': None if last is None or ev['flat'] else float(last['Unrealised %']),
+                             'Open P&L': ev['open_pnl'], 'Closed trades': ev['closed_n'],
+                             'Closed P&L': ev['closed_pnl'], 'Total P&L': ev['closed_pnl'] + ev['open_pnl'],
+                             'Last signal': '-' if last is None else last['Signal'],
+                             'Last bar': '-' if last is None else str(last['Date'])[:16]})
+            if rows:
+                tot = sum(r['Total P&L'] for r in rows)
+                st.metric('Folder total P&L (all files)', money(tot))
+                st.dataframe(pd.DataFrame(rows), width='stretch', hide_index=True)
+            return
+
+        chosen = st.multiselect('Open file(s)', files, default=files[:1], format_func=lambda f: f[:-5])
+        layout = st.radio('Layout', ['Side by side', 'One below another'], horizontal=True) if len(chosen) > 1 else 'One below another'
+        cols = st.columns(len(chosen)) if layout == 'Side by side' and len(chosen) > 1 else [st.container() for _ in chosen]
+        for col, f in zip(cols, chosen):
+            with col:
+                if f in evs:
+                    detail(evs[f])
+                    if st.checkbox('Delete this file', key=f'del_{folder}_{f}'):
+                        if st.button('Confirm delete', key=f'delbtn_{folder}_{f}'):
+                            delete_strategy(folder, f)
+                            st.rerun()
+
+    st.fragment(run_every=int(refresh))(body)()
+
+
+# =============================================================== app
+def main():
+    st.set_page_config(page_title='Live Paper Trading', layout='wide')
+    st.title('Live Paper Trading - Method 2')
+
+    # ---- login screen (nothing is stored on the server)
     if 'creds' not in st.session_state:
         st.subheader('Enter your Angel One details')
         api_key = st.text_input('API key', type='password')
@@ -294,71 +532,20 @@ def main():
         return
 
     with st.sidebar:
-        if st.button('Logout / change details'):
-            for k_ in ('creds', 'smart'):
-                st.session_state.pop(k_, None)
-            st.rerun()
-        exchange = st.selectbox('Exchange', ['NSE', 'MCX', 'NFO', 'BSE'])
-        symbol = st.text_input('Trading symbol', 'Nifty 50',
-                               help='Index: Nifty 50  |  Stock: RELIANCE (or RELIANCE-EQ)  |  MCX: exact future symbol, e.g. GOLDM05DEC25FUT')
-        tf = st.selectbox('Timeframe', list(TF))
-        profit = st.number_input('Profit target %', 0.5, 50.0, 1.0, 0.5)
-        lots = st.number_input('Max lots', 1, 500, 10, 1)
-        start = st.date_input('Start date (position starts flat here)', dt.date(dt.date.today().year, 1, 1))
-        default_close = dt.time(23, 30) if exchange == 'MCX' else dt.time(15, 30)
-        close_t = st.time_input('Market close', default_close)
-        refresh = st.number_input('Refresh every (seconds)', 15, 3600, 60, 15)
-        topic = st.text_input('ntfy topic (optional)')
+        with st.expander('Account', expanded=False):
+            st.write(f"Client ID: {st.session_state['creds']['client_id']}")
+            topic = st.text_input('ntfy topic (optional)')
+            refresh = st.number_input('Refresh every (seconds)', 15, 3600, 60, 15)
+            if st.button('Logout / change details'):
+                for k_ in ('creds', 'smart'):
+                    st.session_state.pop(k_, None)
+                st.rerun()
 
-    @st.cache_data(ttl=30, show_spinner=False)
-    def load(_smart, client_id, ex, sym, tf_, start_):
-        return fetch_candles(_smart, ex, sym, tf_, start_)
-
-    def render():
-        cid = st.session_state['creds']['client_id']
-        try:
-            raw = load(get_smart(), cid, exchange, symbol, tf, start)
-        except Exception:
-            try:                                   # session may have expired -> login again once
-                raw = load(relogin(), cid, exchange, symbol, tf, start)
-            except Exception as e:
-                st.error(f'Data error: {e}')
-                return
-        now = pd.Timestamp.now()
-        df = prepare(raw, tf, close_t, now)
-        tr, trades = compute_m2(df, profit, int(lots), start)
-        if tr.empty:
-            st.info('Not enough candles yet for the cloud (needs 78+ bars).')
-            return
-        last = tr.iloc[-1]
-        flat = last['Signal'] in ('EXIT', 'BUY+EXIT')
-        notify_new_signal(topic, f'{exchange}:{symbol}:{tf}', last)
-
-        c = st.columns(6)
-        c[0].metric('Last closed bar', str(last['Date'])[:16])
-        c[1].metric('Close', f"{last['Close']:.2f}")
-        c[2].metric('Cloud top / bottom', f"{last['CloudTop']:.2f} / {last['CloudBottom']:.2f}")
-        c[3].metric('Position', 'Flat (exited)' if flat else f"{int(last['Lots'])} lots")
-        c[4].metric('Avg entry', '-' if flat or pd.isna(last['AvgPrice']) else f"{last['AvgPrice']:.2f}")
-        c[5].metric('Signal', last['Signal'],
-                    None if flat or pd.isna(last['Unrealised %']) else f"{last['Unrealised %']:.2f}%")
-        st.caption(f"Refreshed {now:%H:%M:%S}  |  only closed candles used  |  {len(df)} candles loaded")
-
-        view = tr.tail(150).set_index('Date')
-        st.line_chart(view[['Close', 'CloudTop', 'CloudBottom']])
-        t1, t2 = st.tabs(['Bar log (latest first)', 'Trades'])
-        with t1:
-            st.dataframe(tr.sort_values('Date', ascending=False).head(100), use_container_width=True, hide_index=True)
-        with t2:
-            if trades.empty:
-                st.write('No trades yet.')
-            else:
-                st.dataframe(trades.sort_values('Exit Date', ascending=False), use_container_width=True, hide_index=True)
-                closed = trades[~trades['Exit Reason'].str.startswith('Open at end')]
-                st.write(f"Closed trades: {len(closed)}   |   Closed P&L: {closed['PnL (pts x qty)'].sum():,.2f}"
-                         f"   |   Open P&L: {trades['PnL (pts x qty)'].sum() - closed['PnL (pts x qty)'].sum():,.2f}")
-
-    st.fragment(run_every=int(refresh))(render)()
+    page = st.radio('Page', ['Builder', 'My strategies'], horizontal=True, label_visibility='collapsed')
+    if page == 'Builder':
+        page_builder()
+    else:
+        page_view(topic, refresh)
 
 
 if __name__ == '__main__':
