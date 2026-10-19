@@ -39,6 +39,21 @@ TF = {
 }
 LOTS_OPTIONS = [10, 20, 30, 40, 50, 60, 70, 80, 90, 100]
 TARGET_OPTIONS = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
+SPAN_OPTIONS = {'SPAN A': 'A', 'SPAN B': 'B', 'SPAN A & B': 'A&B', 'SPAN A OR B': 'AorB'}
+EXIT_OPTIONS = TARGET_OPTIONS + list(SPAN_OPTIONS)               # the 14 options of "Profit target / Span exit"
+CANDLE_OPTIONS = {'Every candle': 'every', 'Daily': 'daily', 'Weekly': 'weekly'}
+
+
+def exit_label(x):
+    return f'{x}%' if isinstance(x, (int, float)) else x
+
+
+def exit_text(s):
+    return s.get('exit_label') or f"{s['profit']}%"
+
+
+def candle_text(s):
+    return {v: k for k, v in CANDLE_OPTIONS.items()}.get(s.get('candle', 'every'), 'Every candle')
 
 
 # =============================================================== ENGINE (M2 only, copied from m.py - same logic)
@@ -58,16 +73,43 @@ def add_ichimoku_cloud(df):
     return df
 
 
-def run_m2(df, profit_target_pct, max_lots, start_date=None, lot_qty=1.0, trace=None):
-    """Method 2 (Google-sheet logic). Returns trades DataFrame; trace (list) gets one dict per bar."""
+SPAN_RULES = {                       # exit rule for the "Span" options (price = bar Close)
+    'A':    lambda p, a, b: p < a,
+    'B':    lambda p, a, b: p < b,
+    'A&B':  lambda p, a, b: p < a and p < b,      # below BOTH spans  (= below the cloud bottom)
+    'AorB': lambda p, a, b: p < a or p < b,       # below EITHER span (= below the cloud top)
+}
+SPAN_TEXT = {'A': 'Span A', 'B': 'Span B', 'A&B': 'Span A & B', 'AorB': 'Span A or B'}
+
+
+def run_m2(df, profit_target_pct, max_lots, start_date=None, lot_qty=1.0, trace=None, span=None, candle='every'):
+    """Method 2 (Google-sheet logic).
+    span   : None = exit on Profit target %;  'A' / 'B' / 'A&B' / 'AorB' = exit when Close falls below that span
+             (whole position closed; span exits go flat, no repeat exits).
+    candle : 'every' = buy 1 lot on every candle above the cloud;  'daily' = at most 1 lot per day;
+             'weekly' = at most 1 lot per week (first candle of the period that closes above the cloud).
+    Returns trades DataFrame; trace (list) gets one dict per bar."""
     full = add_ichimoku_cloud(df)
     if start_date is not None:   # cloud uses full history, simulation starts flat from start_date
         full = full[full['Date'] >= pd.Timestamp(start_date)].reset_index(drop=True)
     rows = full.to_dict('records')
+    span_hit = SPAN_RULES.get(span)
+    original = candle == 'every' and span_hit is None      # exactly the sheet logic of m.py
 
+    def pkey(d):
+        if candle == 'daily':
+            return d.date()
+        if candle == 'weekly':
+            y, w, _ = d.isocalendar()
+            return (y, w)
+        return None
+
+    exit_reason = (f'Closed below {SPAN_TEXT[span]} (Method 2)' if span_hit
+                   else f'Profit target {profit_target_pct}% hit (Method 2 - sheet logic)')
     trades = []
     trade_id = 0
     m2_first, m2_lots, m2_avg, m2_prev_exit, m2_seg_start = True, 0, None, False, None
+    last_buy_key = None
 
     for row in rows:
         if pd.isna(row['CloudTop']) or pd.isna(row['CloudBottom']):
@@ -78,23 +120,38 @@ def run_m2(df, profit_target_pct, max_lots, start_date=None, lot_qty=1.0, trace=
             m2_first = False
             m2_lots = 1 if above else 0
             m2_avg = price if m2_lots == 1 else None
+            if m2_lots == 1:
+                last_buy_key = pkey(date)
         else:
-            prev_lots = m2_lots
-            if not above:
+            prev_lots, bought = m2_lots, False
+            can_buy = candle == 'every' or pkey(date) != last_buy_key
+            if not above or not can_buy:
                 pass
             elif m2_prev_exit:
-                m2_lots = 1
+                m2_lots, bought = 1, True
             elif m2_lots < max_lots:
-                m2_lots += 1
-            if m2_lots == 1:
-                m2_avg = price
-            elif m2_lots > prev_lots:
-                m2_avg = (m2_avg * prev_lots + price) / m2_lots
+                m2_lots, bought = m2_lots + 1, True
+            if bought:
+                last_buy_key = pkey(date)
+            if original:                                   # sheet quirk: avg follows Close while lots == 1
+                if m2_lots == 1:
+                    m2_avg = price
+                elif m2_lots > prev_lots:
+                    m2_avg = (m2_avg * prev_lots + price) / m2_lots
+            elif bought:
+                if m2_lots == 1:
+                    m2_avg = price
+                else:
+                    m2_avg = (m2_avg * prev_lots + price) / m2_lots
         m2_prev_exit = False
         if m2_seg_start is None and m2_lots > 0:
             m2_seg_start = date
         if m2_lots > 0 and m2_avg:
-            if (price - m2_avg) / m2_avg >= profit_target_pct / 100.0:
+            if span_hit:
+                hit = span_hit(price, row['SenkouA'], row['SenkouB'])
+            else:
+                hit = (price - m2_avg) / m2_avg >= profit_target_pct / 100.0
+            if hit:
                 trade_id += 1
                 trades.append({
                     'Trade ID': trade_id, 'Entry Date (1st lot)': m2_seg_start, 'Exit Date': date,
@@ -103,9 +160,11 @@ def run_m2(df, profit_target_pct, max_lots, start_date=None, lot_qty=1.0, trace=
                     'Exit Price': round(price, 4),
                     'Profit % (on avg entry)': round((price - m2_avg) / m2_avg * 100, 2),
                     'PnL (pts x qty)': round((price - m2_avg) * m2_lots * lot_qty, 2),
-                    'Exit Reason': f'Profit target {profit_target_pct}% hit (Method 2 - sheet logic)'})
+                    'Exit Reason': exit_reason})
                 m2_prev_exit = True
                 m2_seg_start = None
+                if span_hit:                               # span exit = flat (no repeat exit on the old lots)
+                    m2_lots, m2_avg = 0, None
         if trace is not None:
             trace.append({'Date': date, 'Close': price, 'CloudTop': row['CloudTop'],
                           'CloudBottom': row['CloudBottom'], 'Above': above, 'Lots': m2_lots,
@@ -213,9 +272,9 @@ def prepare(raw, tf, close_t, now):
 
 
 # =============================================================== M2 live state
-def compute_m2(df, profit_pct, max_lots, start, qty=1.0):
+def compute_m2(df, profit_pct, max_lots, start, qty=1.0, span=None, candle='every'):
     trace = []
-    trades = run_m2(df, profit_pct, max_lots, start_date=start, lot_qty=qty, trace=trace)
+    trades = run_m2(df, profit_pct, max_lots, start_date=start, lot_qty=qty, trace=trace, span=span, candle=candle)
     tr = pd.DataFrame(trace)
     if tr.empty:
         return tr, trades
@@ -292,25 +351,31 @@ def delete_strategy(folder, fname):
     os.remove(os.path.join(user_dir(), safe(folder), fname))
 
 
-def create_strategies(folder, prefix, exchange, symbols, tf, capital, qty, close, lots_list, targets, start):
-    """one file per symbol x lots x target. Existing file is NOT overwritten (keeps its start time)."""
+def create_strategies(folder, prefix, exchange, symbols, tf, capital, qty, close, lots_list, exits, candles, start):
+    """one file per symbol x lots x exit option x candle mode. Existing file is NOT overwritten (keeps its start time)."""
     d = os.path.join(user_dir(), safe(folder))
     os.makedirs(d, exist_ok=True)
     made, skipped = [], []
     for sym in symbols:
         for lots in lots_list:
-            for tp in targets:
-                name = f"{prefix + ' ' if prefix else ''}{sym} {tf} {lots}lots {tp}%"
-                path = os.path.join(d, safe(name) + '.json')
-                if os.path.exists(path):
-                    skipped.append(name)
-                    continue
-                s = {'name': name, 'folder': folder, 'mode': 'paper', 'exchange': exchange, 'symbol': sym,
-                     'tf': tf, 'profit': tp, 'lots': lots, 'capital': capital, 'qty': qty, 'close': close,
-                     'start': start, 'created': dt.datetime.now().strftime('%Y-%m-%d %H:%M')}
-                with open(path, 'w', encoding='utf-8') as f:
-                    json.dump(s, f, indent=1)
-                made.append(name)
+            for ex in exits:
+                for cd in candles:
+                    cdc = CANDLE_OPTIONS[cd]
+                    name = (f"{prefix + ' ' if prefix else ''}{sym} {tf} {lots}lots {exit_label(ex)}"
+                            + ('' if cdc == 'every' else f' {cdc}'))
+                    path = os.path.join(d, safe(name) + '.json')
+                    if os.path.exists(path):
+                        skipped.append(name)
+                        continue
+                    is_span = ex in SPAN_OPTIONS
+                    s = {'name': name, 'folder': folder, 'mode': 'paper', 'exchange': exchange, 'symbol': sym,
+                         'tf': tf, 'profit': None if is_span else ex, 'span': SPAN_OPTIONS.get(ex),
+                         'exit_label': exit_label(ex), 'candle': cdc, 'lots': lots, 'capital': capital,
+                         'qty': qty, 'close': close, 'start': start,
+                         'created': dt.datetime.now().strftime('%Y-%m-%d %H:%M')}
+                    with open(path, 'w', encoding='utf-8') as f:
+                        json.dump(s, f, indent=1)
+                    made.append(name)
     return made, skipped
 
 
@@ -334,7 +399,8 @@ def evaluate(s):
     h, m = [int(x) for x in s['close'].split(':')]
     raw = get_candles(s)
     df = prepare(raw, s['tf'], dt.time(h, m), pd.Timestamp.now())
-    tr, trades = compute_m2(df, s['profit'], int(s['lots']), s['start'], s['qty'])
+    tr, trades = compute_m2(df, s.get('profit') or 0.0, int(s['lots']), s['start'], s['qty'],
+                            span=s.get('span'), candle=s.get('candle', 'every'))
     out = {'s': s, 'tr': tr, 'trades': trades, 'status': 'Waiting for 1st candle', 'last': None,
            'closed_n': 0, 'closed_pnl': 0.0, 'open_pnl': 0.0, 'invested': 0.0}
     if tr.empty:
@@ -446,9 +512,12 @@ def page_builder():
         st.caption('Max lots (one file each)')
         lots_list = checkbox_dropdown('Select Max lots', LOTS_OPTIONS, [10], 'lots')
     qty = c2.number_input('Quantity per lot', min_value=1.0, value=1.0, step=1.0)
+    st.markdown('**Candle**')
+    st.caption('Buy on  (one file each)')
+    candles = checkbox_dropdown('Select candle', list(CANDLE_OPTIONS), ['Every candle'], 'candle')
     st.markdown('**Exit condition**')
-    st.caption('Target % (one file each)')
-    targets = checkbox_dropdown('Select Target %', TARGET_OPTIONS, [1, 2], 'targets', fmt=lambda x: f'{x}%')
+    st.caption(f'Profit target / Span exit ({len(EXIT_OPTIONS)})  (one file each)')
+    targets = checkbox_dropdown('Select profit target / span exit', EXIT_OPTIONS, [1, 2], 'exits', fmt=exit_label)
     c1, c2, c3 = st.columns(3)
     close_t = c1.time_input('Market close', dt.time(23, 30) if exchange == 'MCX' else dt.time(15, 30), key=f'close_{exchange}')
     start_mode = c2.radio('Start from', ['Now', 'Pick date'], horizontal=True)
@@ -463,16 +532,16 @@ def page_builder():
         if x.upper() not in seen:
             seen.add(x.upper())
             symbols.append(x)
-    n = len(symbols) * len(lots_list) * len(targets)
-    st.caption(f'{len(symbols)} symbol(s) x {len(lots_list)} lots x {len(targets)} targets = {n} file(s) will be saved.  Start = {start}  ({"first candle that closes after this" if start_mode == "Now" else "backfilled from that date"})')
+    n = len(symbols) * len(lots_list) * len(targets) * len(candles)
+    st.caption(f'{len(symbols)} symbol(s) x {len(lots_list)} lots x {len(targets)} exits x {len(candles)} candle mode(s) = {n} file(s) will be saved.  Start = {start}  ({"first candle that closes after this" if start_mode == "Now" else "backfilled from that date"})')
     st.caption('Live trading (real orders) is not included - run Paper first and check the numbers.')
     if st.button('Start', type='primary'):
         if not folder or not folder.strip():
             st.error('Give a folder name.')
         elif n == 0:
-            st.error('Pick (or type) at least one symbol, one Max lots and one Target %.')
-        elif n > 60:
-            st.error('Too many files (max 60 at a time).')
+            st.error('Pick (or type) at least one symbol, one Max lots, one candle option and one exit option.')
+        elif n > 150:
+            st.error('Too many files (max 150 at a time).')
         else:
             try:
                 for sym in symbols:
@@ -481,7 +550,7 @@ def page_builder():
                 st.error(str(e))
                 return
             made, skipped = create_strategies(folder.strip(), prefix.strip(), exchange, symbols, tf, capital, qty,
-                                              close_t.strftime('%H:%M'), lots_list, targets, start)
+                                              close_t.strftime('%H:%M'), lots_list, targets, candles, start)
             if made:
                 st.success(f'Saved {len(made)} file(s) in folder "{folder.strip()}". Open "My strategies" to watch them live.')
             if skipped:
@@ -491,7 +560,7 @@ def page_builder():
 def detail(ev):
     s, tr, trades, last = ev['s'], ev['tr'], ev['trades'], ev['last']
     st.markdown(f"#### {s['name']}")
-    st.caption(f"{s['exchange']}:{s['symbol']}  |  {s['tf']}  |  {s['lots']} lots  |  target {s['profit']}%  |  qty/lot {s['qty']:g}"
+    st.caption(f"{s['exchange']}:{s['symbol']}  |  {s['tf']}  |  {s['lots']} lots  |  exit {exit_text(s)}  |  buy {candle_text(s).lower()}  |  qty/lot {s['qty']:g}"
                f"  |  capital {money(s['capital'])}  |  started {s['start']}")
     if last is None:
         st.info('Waiting for the first closed candle after the start time (cloud needs 78+ bars of history).')
@@ -550,7 +619,7 @@ def page_view(topic, refresh):
             rows = []
             for f, ev in evs.items():
                 s, last = ev['s'], ev['last']
-                rows.append({'File': s['name'], 'Status': ev['status'],
+                rows.append({'File': s['name'], 'Exit': exit_text(s), 'Candle': candle_text(s), 'Status': ev['status'],
                              'Avg entry': None if last is None or ev['flat'] else float(last['AvgPrice']),
                              'Close': None if last is None else float(last['Close']),
                              'Unrealised %': None if last is None or ev['flat'] else float(last['Unrealised %']),
