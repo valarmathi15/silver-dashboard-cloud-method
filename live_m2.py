@@ -43,6 +43,7 @@ LOTS_OPTIONS = [10, 20, 30, 40, 50, 60, 70, 80, 90, 100]
 TARGET_OPTIONS = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
 SPAN_OPTIONS = {'SPAN A': 'A', 'SPAN B': 'B', 'SPAN A & B': 'A&B', 'SPAN A OR B': 'AorB'}
 EXIT_OPTIONS = TARGET_OPTIONS + list(SPAN_OPTIONS)               # the 14 options of "Profit target / Span exit"
+AMOUNT_OPTIONS = [1000, 5000, 10000, 25000, 50000, 100000, 200000, 500000]
 QTY_OPTIONS = [1, 2, 5, 10, 25, 50, 75, 100, 150, 200, 500, 1000]
 CANDLE_OPTIONS = {'Every candle': 'every', 'Daily': 'daily', 'Weekly': 'weekly'}
 
@@ -85,10 +86,11 @@ SPAN_RULES = {                       # exit rule for the "Span" options (price =
 SPAN_TEXT = {'A': 'Span A', 'B': 'Span B', 'A&B': 'Span A & B', 'AorB': 'Span A or B'}
 
 
-def run_m2(df, profit_target_pct, max_lots, start_date=None, lot_qty=1.0, trace=None, span=None, candle='every'):
+def run_m2(df, profit_target_pct, max_lots, start_date=None, lot_qty=1.0, trace=None, span=None, candle='every', lot_amount=None):
     """Method 2 (Google-sheet logic).
     span   : None = exit on Profit target %;  'A' / 'B' / 'A&B' / 'AorB' = exit when Close falls below that span
              (whole position closed; span exits go flat, no repeat exits).
+    lot_amount : None = every lot buys `lot_qty` units;  number = every lot invests this AMOUNT (units = amount / lot price).
     candle : 'every' = buy 1 lot on every candle above the cloud;  'daily' = at most 1 lot per day;
              'weekly' = at most 1 lot per week (first candle of the period that closes above the cloud).
     Returns trades DataFrame; trace (list) gets one dict per bar."""
@@ -111,6 +113,7 @@ def run_m2(df, profit_target_pct, max_lots, start_date=None, lot_qty=1.0, trace=
     trades = []
     trade_id = 0
     m2_first, m2_lots, m2_avg, m2_prev_exit, m2_seg_start = True, 0, None, False, None
+    m2_qty, m2_cost = 0.0, 0.0                     # units held and money spent (avg price = cost / units)
     last_buy_key = None
 
     for row in rows:
@@ -118,12 +121,11 @@ def run_m2(df, profit_target_pct, max_lots, start_date=None, lot_qty=1.0, trace=
             continue
         price, date = row['Close'], row['Date']
         above = bool(row['AboveCloud'])
-        bought = False
+        bought, prev_lots = False, 0
         if m2_first:
             m2_first = False
             m2_lots = 1 if above else 0
             bought = m2_lots == 1
-            m2_avg = price if m2_lots == 1 else None
             if m2_lots == 1:
                 last_buy_key = pkey(date)
         else:
@@ -137,11 +139,13 @@ def run_m2(df, profit_target_pct, max_lots, start_date=None, lot_qty=1.0, trace=
                 m2_lots, bought = m2_lots + 1, True
             if bought:
                 last_buy_key = pkey(date)
-            if bought:                                     # avg price changes ONLY when a lot is bought
-                if m2_lots == 1:
-                    m2_avg = price
-                else:
-                    m2_avg = (m2_avg * prev_lots + price) / m2_lots
+        if bought:                                         # avg price changes ONLY when a lot is bought
+            q = (lot_amount / price) if lot_amount else lot_qty
+            if prev_lots == 0:
+                m2_qty, m2_cost = q, q * price
+            else:
+                m2_qty, m2_cost = m2_qty + q, m2_cost + q * price
+            m2_avg = m2_cost / m2_qty
         m2_prev_exit = False
         if m2_seg_start is None and m2_lots > 0:
             m2_seg_start = date
@@ -158,14 +162,14 @@ def run_m2(df, profit_target_pct, max_lots, start_date=None, lot_qty=1.0, trace=
                     'Max Lots Allowed': max_lots, 'Avg Entry Price': round(m2_avg, 4),
                     'Exit Price': round(price, 4),
                     'Profit % (on avg entry)': round((price - m2_avg) / m2_avg * 100, 2),
-                    'PnL (pts x qty)': round((price - m2_avg) * m2_lots * lot_qty, 2),
+                    'PnL (pts x qty)': round((price - m2_avg) * m2_qty, 2),
                     'Exit Reason': exit_reason})
                 m2_prev_exit = True
                 m2_seg_start = None
-                m2_lots, m2_avg = 0, None                  # exit = flat; fresh trade on the next close above cloud
+                m2_lots, m2_avg, m2_qty, m2_cost = 0, None, 0.0, 0.0   # exit = flat; fresh trade on the next close above cloud
         if trace is not None:
             trace.append({'Date': date, 'Close': price, 'CloudTop': row['CloudTop'],
-                          'CloudBottom': row['CloudBottom'], 'Above': above, 'Lots': m2_lots, 'Bought': bought,
+                          'CloudBottom': row['CloudBottom'], 'Above': above, 'Lots': m2_lots, 'Bought': bought, 'Qty': m2_qty,
                           'AvgPrice': None if not m2_avg else round(m2_avg, 4),
                           'Action': 'EXIT' if m2_prev_exit else ''})
 
@@ -178,7 +182,7 @@ def run_m2(df, profit_target_pct, max_lots, start_date=None, lot_qty=1.0, trace=
             'Max Lots Allowed': max_lots, 'Avg Entry Price': round(m2_avg, 4),
             'Exit Price': round(price, 4),
             'Profit % (on avg entry)': round((price - m2_avg) / m2_avg * 100, 2),
-            'PnL (pts x qty)': round((price - m2_avg) * m2_lots * lot_qty, 2),
+            'PnL (pts x qty)': round((price - m2_avg) * m2_qty, 2),
             'Exit Reason': 'Open at end of data (marked to last close)'})
     return pd.DataFrame(trades)
 
@@ -340,9 +344,9 @@ def prepare(raw, tf, close_t, now):
 
 
 # =============================================================== M2 live state
-def compute_m2(df, profit_pct, max_lots, start, qty=1.0, span=None, candle='every'):
+def compute_m2(df, profit_pct, max_lots, start, qty=1.0, span=None, candle='every', amount=None):
     trace = []
-    trades = run_m2(df, profit_pct, max_lots, start_date=start, lot_qty=qty, trace=trace, span=span, candle=candle)
+    trades = run_m2(df, profit_pct, max_lots, start_date=start, lot_qty=qty, trace=trace, span=span, candle=candle, lot_amount=amount)
     tr = pd.DataFrame(trace)
     if tr.empty:
         return tr, trades
@@ -425,20 +429,20 @@ def delete_strategy(folder, fname):
     os.remove(os.path.join(user_dir(), safe(folder), fname))
 
 
-def create_strategies(folder, prefix, exchange, symbols, tf, capital, qty_list, close, lots_list, exits, candles, start):
+def create_strategies(folder, prefix, exchange, symbols, tf, capital, sizes, close, lots_list, exits, candles, start):
     """one file per symbol x lots x exit option x candle mode. Existing file is NOT overwritten (keeps its start time)."""
     d = os.path.join(user_dir(), safe(folder))
     os.makedirs(d, exist_ok=True)
     made, skipped = [], []
     for sym in symbols:
         for lots in lots_list:
-          for qty in qty_list:
+          for kind, val in sizes:
             for ex in exits:
                 for cd in candles:
                     cdc = CANDLE_OPTIONS[cd]
                     name = (f"{prefix + ' ' if prefix else ''}{sym} {tf} {lots}lots {exit_label(ex)}"
                             + ('' if cdc == 'every' else f' {cdc}')
-                            + (f' q{qty:g}' if len(qty_list) > 1 else ''))
+                            + (f' amt{val:g}' if kind == 'amt' else (f' q{val:g}' if len(sizes) > 1 else '')))
                     path = os.path.join(d, safe(name) + '.json')
                     if os.path.exists(path):
                         skipped.append(name)
@@ -447,7 +451,7 @@ def create_strategies(folder, prefix, exchange, symbols, tf, capital, qty_list, 
                     s = {'name': name, 'folder': folder, 'mode': 'paper', 'exchange': exchange, 'symbol': sym,
                          'tf': tf, 'profit': None if is_span else ex, 'span': SPAN_OPTIONS.get(ex),
                          'exit_label': exit_label(ex), 'candle': cdc, 'lots': lots, 'capital': capital,
-                         'qty': qty, 'close': close, 'start': start,
+                         'qty': val if kind == 'qty' else 1.0, 'amount': val if kind == 'amt' else None, 'close': close, 'start': start,
                          'created': dt.datetime.now().strftime('%Y-%m-%d %H:%M')}
                     with open(path, 'w', encoding='utf-8') as f:
                         json.dump(s, f, indent=1)
@@ -473,7 +477,7 @@ def evaluate(s):
     raw, checked, data_err = get_candles(s)
     df = prepare(raw, s['tf'], dt.time(h, m), pd.Timestamp.now())
     tr, trades = compute_m2(df, s.get('profit') or 0.0, int(s['lots']), s['start'], s['qty'],
-                            span=s.get('span'), candle=s.get('candle', 'every'))
+                            span=s.get('span'), candle=s.get('candle', 'every'), amount=s.get('amount'))
     out = {'s': s, 'tr': tr, 'trades': trades, 'status': 'Waiting for 1st candle', 'last': None,
            'checked': checked, 'data_err': data_err,
            'closed_n': 0, 'closed_pnl': 0.0, 'open_pnl': 0.0, 'invested': 0.0}
@@ -486,7 +490,7 @@ def evaluate(s):
     out.update(last=last, flat=flat, closed_n=len(closed),
                closed_pnl=float(closed['PnL (pts x qty)'].sum()) if len(closed) else 0.0,
                open_pnl=0.0 if flat or openrows.empty else float(openrows['PnL (pts x qty)'].sum()),
-               invested=0.0 if flat else float(last['Lots']) * float(last['AvgPrice']) * float(s['qty']),
+               invested=0.0 if flat else float(last['Qty']) * float(last['AvgPrice']),
                status='Flat' if flat else f"Holding {int(last['Lots'])} lots")
     return out
 
@@ -592,17 +596,24 @@ def page_builder():
         st.caption('Max lots (one file each)')
         lots_list = checkbox_dropdown('Select Max lots', LOTS_OPTIONS, [10], 'lots')
     with c2:
-        st.caption('Quantity per lot (one file each)')
-        qty_list = [float(q) for q in checkbox_dropdown('Select quantity', QTY_OPTIONS, [1], 'qty')]
-        qty_txt = st.text_input('Or type quantity', label_visibility='collapsed', placeholder='or type: 3, 15, 40',
-                                help='Any quantity you type (comma separated) is added to the ticked ones.')
-        for x in qty_txt.split(','):
+        mode = st.radio('Each lot by', ['Quantity', 'Amount'], horizontal=True, label_visibility='collapsed')
+        if mode == 'Quantity':
+            vals = [float(q) for q in checkbox_dropdown('Select quantity per lot', QTY_OPTIONS, [1], 'qty')]
+            kind, ph = 'qty', 'or type quantity: 3, 15, 40'
+        else:
+            vals = [float(q) for q in checkbox_dropdown('Select amount per lot', AMOUNT_OPTIONS, [10000], 'amt')]
+            kind, ph = 'amt', 'or type amount: 15000, 75000'
+        size_txt = st.text_input('Or type', label_visibility='collapsed', placeholder=ph, key=f'size_txt_{kind}',
+                                 help='Comma separated. Typed values are added to the ticked ones, one file each. '
+                                      'Amount = money put in every lot (units = amount / price of that lot).')
+        for x in size_txt.split(','):
             try:
                 v = float(x.strip())
             except ValueError:
                 continue
-            if v > 0 and v not in qty_list:
-                qty_list.append(v)
+            if v > 0 and v not in vals:
+                vals.append(v)
+        sizes = [(kind, v) for v in vals]
     with c3:
         st.caption('Buy on (one file each)')
         candles = checkbox_dropdown('Select candle', list(CANDLE_OPTIONS), ['Every candle'], 'candle')
@@ -616,14 +627,14 @@ def page_builder():
         if x.upper() not in seen:
             seen.add(x.upper())
             symbols.append(x)
-    n = len(symbols) * len(lots_list) * len(qty_list) * len(targets) * len(candles)
-    st.caption(f'{len(symbols)} symbol(s) x {len(lots_list)} lots x {len(qty_list)} qty x {len(targets)} exits x {len(candles)} candle mode(s) = {n} file(s) will be saved.  Start = {start}  (live - first candle that closes after this)')
+    n = len(symbols) * len(lots_list) * len(sizes) * len(targets) * len(candles)
+    st.caption(f'{len(symbols)} symbol(s) x {len(lots_list)} lots x {len(sizes)} {'qty' if kind == 'qty' else 'amount'} x {len(targets)} exits x {len(candles)} candle mode(s) = {n} file(s) will be saved.  Start = {start}  (live - first candle that closes after this)')
     st.caption('Live trading (real orders) is not included - run Paper first and check the numbers.')
     if st.button('Start', type='primary'):
         if not folder or not folder.strip():
             st.error('Give a folder name.')
         elif n == 0:
-            st.error('Pick (or type) at least one symbol, one Max lots, one quantity, one candle option and one exit option.')
+            st.error('Pick (or type) at least one symbol, one Max lots, one quantity/amount, one candle option and one exit option.')
         elif n > 150:
             st.error('Too many files (max 150 at a time).')
         else:
@@ -633,7 +644,7 @@ def page_builder():
             except Exception as e:
                 st.error(str(e))
                 return
-            made, skipped = create_strategies(folder.strip(), prefix.strip(), exchange, symbols, tf, capital, qty_list,
+            made, skipped = create_strategies(folder.strip(), prefix.strip(), exchange, symbols, tf, capital, sizes,
                                               close_t.strftime('%H:%M'), lots_list, targets, candles, start)
             if made:
                 st.success(f'Saved {len(made)} file(s) in folder "{folder.strip()}". Open "My strategies" to watch them live.')
@@ -644,7 +655,7 @@ def page_builder():
 def detail(ev):
     s, tr, trades, last = ev['s'], ev['tr'], ev['trades'], ev['last']
     st.markdown(f"#### {s['name']}")
-    st.caption(f"{s['exchange']}:{s['symbol']}  |  {s['tf']}  |  {s['lots']} lots  |  exit {exit_text(s)}  |  buy {candle_text(s).lower()}  |  qty/lot {s['qty']:g}"
+    st.caption(f"{s['exchange']}:{s['symbol']}  |  {s['tf']}  |  {s['lots']} lots  |  exit {exit_text(s)}  |  buy {candle_text(s).lower()}  |  {('amount/lot ' + format(s['amount'], ',.0f')) if s.get('amount') else ('qty/lot ' + format(s['qty'], 'g'))}"
                f"  |  capital {money(s['capital'])}  |  started {s['start']}")
     if last is None:
         st.info('Waiting for the first closed candle after the start time (cloud needs 78+ bars of history).')
