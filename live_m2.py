@@ -703,7 +703,6 @@ def page_view(topic, refresh):
         if not files:
             st.info('This folder is empty.')
             return
-        view = st.radio('View', ['Folder summary', 'Open file(s)'], horizontal=True)
         strategies = [load_strategy(folder, f) for f in files]
         evs, errs = {}, {}
         for f, s in zip(files, strategies):
@@ -723,8 +722,8 @@ def page_view(topic, refresh):
         stale = [ev for ev in evs.values() if ev.get('data_err')]
         ok = not (errs or stale)
         b1, b2, b3, b4 = st.columns(4)
-        b1.metric('Status', 'LIVE - market open' if is_open else 'LIVE - market closed',
-                  'running' if ok else 'check warnings', delta_color='off' if ok else 'inverse')
+        b1.metric('Status', 'LIVE',
+                  ('market open' if is_open else 'market closed') + (' - running' if ok else ' - check warnings'), delta_color='off' if ok else 'inverse')
         b2.metric('Last refresh', now.strftime('%H:%M:%S'), f'next in {int(refresh)}s', delta_color='off')
         checks = [ev['checked'] for ev in evs.values() if ev.get('checked')]
         b3.metric('Angel data checked', dt.datetime.fromtimestamp(max(checks)).strftime('%H:%M:%S') if checks else '-',
@@ -757,34 +756,31 @@ def page_view(topic, refresh):
                         ' - they act only when a candle CLOSES after that time (cloud history is loaded automatically).')
         st.caption(f"Refreshed {now:%H:%M:%S}  |  closed candles only  |  every {refresh}s")
 
-        if view == 'Folder summary':
-            rows = []
-            for f, ev in evs.items():
-                s, last = ev['s'], ev['last']
-                rows.append({'File': s['name'], 'Exit': exit_text(s), 'Candle': candle_text(s), 'Status': ev['status'],
-                             'Avg entry': None if last is None or ev['flat'] else float(last['AvgPrice']),
-                             'Close': None if last is None else float(last['Close']),
-                             'Unrealised %': None if last is None or ev['flat'] else float(last['Unrealised %']),
-                             'Open P&L': ev['open_pnl'], 'Closed trades': ev['closed_n'],
-                             'Closed P&L': ev['closed_pnl'], 'Total P&L': ev['closed_pnl'] + ev['open_pnl'],
-                             'Last signal': '-' if last is None else last['Signal'],
-                             'Last bar': '-' if last is None else str(last['Date'])[:16],
-                             'Started': s['start'],
-                             'Data checked': dt.datetime.fromtimestamp(ev['checked']).strftime('%H:%M:%S') if ev.get('checked') else '-'})
-            if rows:
-                tot = sum(r['Total P&L'] for r in rows)
-                st.metric('Folder total P&L (all files)', money(tot))
-                st.dataframe(pd.DataFrame(rows), width='stretch', hide_index=True)
-            return
+        tot = sum(ev['closed_pnl'] + ev['open_pnl'] for ev in evs.values())
+        st.metric('Folder total P&L (all files)', money(tot))
+        st.markdown(f'**Strategies in "{folder}"** ({len(files)}) - click "Live details" under a strategy to watch it run')
 
-        st.caption('Open file(s)')
-        chosen = checkbox_dropdown('Select files', files, files[:1], f'files_{folder}', fmt=lambda f: f[:-5])
-        layout = st.radio('Layout', ['Side by side', 'One below another'], horizontal=True) if len(chosen) > 1 else 'One below another'
-        cols = st.columns(len(chosen)) if layout == 'Side by side' and len(chosen) > 1 else [st.container() for _ in chosen]
-        for col, f in zip(cols, chosen):
-            with col:
-                if f in evs:
-                    detail(evs[f])
+        for f in files:                                            # one card per file, one below another
+            ev = evs.get(f)
+            if ev is None:
+                continue
+            s, last = ev['s'], ev['last']
+            total = ev['closed_pnl'] + ev['open_pnl']
+            icon = '⏳' if last is None else ('⚪' if ev['flat'] else '🟢')
+            with st.container(border=True):
+                c = st.columns([3.2, 1.5, 1.2, 1.2, 1.3])
+                c[0].markdown(f"**{icon} {s['name']}**")
+                c[0].caption(f"{s['exchange']}:{s['symbol']} | {s['tf']} | exit {exit_text(s)} | {candle_text(s).lower()} | started {s['start']}")
+                c[1].caption('Status')
+                c[1].write(ev['status'])
+                c[2].caption('Avg entry')
+                c[2].write('-' if last is None or ev['flat'] else f"{last['AvgPrice']:.2f}")
+                c[3].caption('Close')
+                c[3].write('-' if last is None else f"{last['Close']:.2f}")
+                c[4].caption('Total P&L')
+                c[4].write(money(total))
+                with st.expander('Live details'):                  # constant label -> stays open while it auto-refreshes
+                    detail(ev)
                     if st.checkbox('Delete this file', key=f'del_{folder}_{f}'):
                         if st.button('Confirm delete', key=f'delbtn_{folder}_{f}'):
                             delete_strategy(folder, f)
