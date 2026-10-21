@@ -97,7 +97,6 @@ def run_m2(df, profit_target_pct, max_lots, start_date=None, lot_qty=1.0, trace=
         full = full[full['Date'] >= pd.Timestamp(start_date)].reset_index(drop=True)
     rows = full.to_dict('records')
     span_hit = SPAN_RULES.get(span)
-    original = candle == 'every' and span_hit is None      # exactly the sheet logic of m.py
 
     def pkey(d):
         if candle == 'daily':
@@ -119,9 +118,11 @@ def run_m2(df, profit_target_pct, max_lots, start_date=None, lot_qty=1.0, trace=
             continue
         price, date = row['Close'], row['Date']
         above = bool(row['AboveCloud'])
+        bought = False
         if m2_first:
             m2_first = False
             m2_lots = 1 if above else 0
+            bought = m2_lots == 1
             m2_avg = price if m2_lots == 1 else None
             if m2_lots == 1:
                 last_buy_key = pkey(date)
@@ -136,12 +137,7 @@ def run_m2(df, profit_target_pct, max_lots, start_date=None, lot_qty=1.0, trace=
                 m2_lots, bought = m2_lots + 1, True
             if bought:
                 last_buy_key = pkey(date)
-            if original:                                   # sheet quirk: avg follows Close while lots == 1
-                if m2_lots == 1:
-                    m2_avg = price
-                elif m2_lots > prev_lots:
-                    m2_avg = (m2_avg * prev_lots + price) / m2_lots
-            elif bought:
+            if bought:                                     # avg price changes ONLY when a lot is bought
                 if m2_lots == 1:
                     m2_avg = price
                 else:
@@ -166,11 +162,10 @@ def run_m2(df, profit_target_pct, max_lots, start_date=None, lot_qty=1.0, trace=
                     'Exit Reason': exit_reason})
                 m2_prev_exit = True
                 m2_seg_start = None
-                if span_hit:                               # span exit = flat (no repeat exit on the old lots)
-                    m2_lots, m2_avg = 0, None
+                m2_lots, m2_avg = 0, None                  # exit = flat; fresh trade on the next close above cloud
         if trace is not None:
             trace.append({'Date': date, 'Close': price, 'CloudTop': row['CloudTop'],
-                          'CloudBottom': row['CloudBottom'], 'Above': above, 'Lots': m2_lots,
+                          'CloudBottom': row['CloudBottom'], 'Above': above, 'Lots': m2_lots, 'Bought': bought,
                           'AvgPrice': None if not m2_avg else round(m2_avg, 4),
                           'Action': 'EXIT' if m2_prev_exit else ''})
 
@@ -353,7 +348,7 @@ def compute_m2(df, profit_pct, max_lots, start, qty=1.0, span=None, candle='ever
         return tr, trades
     prev_lots = tr['Lots'].shift(fill_value=0)
     prev_exit = tr['Action'].shift(fill_value='') == 'EXIT'
-    buy = tr['Above'] & ((tr['Lots'] > prev_lots) | prev_exit)
+    buy = tr['Bought'].astype(bool)
     exit_ = tr['Action'] == 'EXIT'
     tr['Signal'] = np.select([buy & exit_, exit_, buy], ['BUY+EXIT', 'EXIT', 'BUY'], 'HOLD')
     tr['Unrealised %'] = np.where(tr['AvgPrice'].notna(),
