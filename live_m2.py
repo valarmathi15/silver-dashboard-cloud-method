@@ -41,6 +41,7 @@ LOTS_OPTIONS = [10, 20, 30, 40, 50, 60, 70, 80, 90, 100]
 TARGET_OPTIONS = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
 SPAN_OPTIONS = {'SPAN A': 'A', 'SPAN B': 'B', 'SPAN A & B': 'A&B', 'SPAN A OR B': 'AorB'}
 EXIT_OPTIONS = TARGET_OPTIONS + list(SPAN_OPTIONS)               # the 14 options of "Profit target / Span exit"
+QTY_OPTIONS = [1, 2, 5, 10, 25, 50, 75, 100, 150, 200, 500, 1000]
 CANDLE_OPTIONS = {'Every candle': 'every', 'Daily': 'daily', 'Weekly': 'weekly'}
 
 
@@ -351,18 +352,20 @@ def delete_strategy(folder, fname):
     os.remove(os.path.join(user_dir(), safe(folder), fname))
 
 
-def create_strategies(folder, prefix, exchange, symbols, tf, capital, qty, close, lots_list, exits, candles, start):
+def create_strategies(folder, prefix, exchange, symbols, tf, capital, qty_list, close, lots_list, exits, candles, start):
     """one file per symbol x lots x exit option x candle mode. Existing file is NOT overwritten (keeps its start time)."""
     d = os.path.join(user_dir(), safe(folder))
     os.makedirs(d, exist_ok=True)
     made, skipped = [], []
     for sym in symbols:
         for lots in lots_list:
+          for qty in qty_list:
             for ex in exits:
                 for cd in candles:
                     cdc = CANDLE_OPTIONS[cd]
                     name = (f"{prefix + ' ' if prefix else ''}{sym} {tf} {lots}lots {exit_label(ex)}"
-                            + ('' if cdc == 'every' else f' {cdc}'))
+                            + ('' if cdc == 'every' else f' {cdc}')
+                            + (f' q{qty:g}' if len(qty_list) > 1 else ''))
                     path = os.path.join(d, safe(name) + '.json')
                     if os.path.exists(path):
                         skipped.append(name)
@@ -501,45 +504,47 @@ def page_builder():
 
     st.markdown('**Entry condition**  - Ichimoku cloud, Method 2')
     picked = []
-    for label, opts in instrument_choices(exchange).items():
-        st.caption(f'{label} ({len(opts)})')
-        picked += checkbox_dropdown(f'Select {label.lower()}', opts, [], f'sym_{exchange}_{label}')
+    groups = list(instrument_choices(exchange).items())
+    if groups:
+        gcols = st.columns(len(groups))                      # Index | Stocks | ... side by side
+        for col, (label, opts) in zip(gcols, groups):
+            with col:
+                st.caption(f'{label} ({len(opts)})')
+                picked += checkbox_dropdown(f'Select {label.lower()}', opts, [], f'sym_{exchange}_{label}')
     typed_txt = st.text_input('Or type names (comma separated)', placeholder='e.g. Nifty 50, RELIANCE, GOLDM05DEC25FUT',
                               help='Index: Nifty 50  |  Stock: RELIANCE (or RELIANCE-EQ)  |  MCX: exact future symbol. '
                                    'Typed names are added to the ticked ones.')
-    c1, c2 = st.columns(2)
+    c1, c2, c3 = st.columns(3)                               # Max lots | Quantity per lot | Candle in ONE row
     with c1:
         st.caption('Max lots (one file each)')
         lots_list = checkbox_dropdown('Select Max lots', LOTS_OPTIONS, [10], 'lots')
-    qty = c2.number_input('Quantity per lot', min_value=1.0, value=1.0, step=1.0)
-    st.markdown('**Candle**')
-    st.caption('Buy on  (one file each)')
-    candles = checkbox_dropdown('Select candle', list(CANDLE_OPTIONS), ['Every candle'], 'candle')
-    st.markdown('**Exit condition**')
-    st.caption(f'Profit target / Span exit ({len(EXIT_OPTIONS)})  (one file each)')
-    targets = checkbox_dropdown('Select profit target / span exit', EXIT_OPTIONS, [1, 2], 'exits', fmt=exit_label)
-    c1, c2, c3 = st.columns(3)
-    close_t = c1.time_input('Market close', dt.time(23, 30) if exchange == 'MCX' else dt.time(15, 30), key=f'close_{exchange}')
-    start_mode = c2.radio('Start from', ['Now', 'Pick date'], horizontal=True)
-    if start_mode == 'Pick date':
-        d0 = c3.date_input('Start date', dt.date.today() - dt.timedelta(days=30))
-        start = pd.Timestamp(d0).strftime('%Y-%m-%d %H:%M')
-    else:
-        start = pd.Timestamp.now().strftime('%Y-%m-%d %H:%M')
+    with c2:
+        st.caption('Quantity per lot (one file each)')
+        qty_list = [float(q) for q in checkbox_dropdown('Select quantity', QTY_OPTIONS, [1], 'qty')]
+    with c3:
+        st.caption('Buy on (one file each)')
+        candles = checkbox_dropdown('Select candle', list(CANDLE_OPTIONS), ['Every candle'], 'candle')
+    c1, c2 = st.columns([3, 1])                              # Exit | Market close in ONE row
+    with c1:
+        st.caption(f'Profit target / Span exit ({len(EXIT_OPTIONS)})  (one file each)')
+        targets = checkbox_dropdown('Select profit target / span exit', EXIT_OPTIONS, [1, 2], 'exits', fmt=exit_label)
+    with c2:
+        close_t = st.time_input('Market close', dt.time(23, 30) if exchange == 'MCX' else dt.time(15, 30), key=f'close_{exchange}')
+    start = pd.Timestamp.now().strftime('%Y-%m-%d %H:%M')    # live only: always start from NOW (no past backfill)
 
     symbols, seen = [], set()
     for x in picked + [t.strip() for t in typed_txt.split(',') if t.strip()]:
         if x.upper() not in seen:
             seen.add(x.upper())
             symbols.append(x)
-    n = len(symbols) * len(lots_list) * len(targets) * len(candles)
-    st.caption(f'{len(symbols)} symbol(s) x {len(lots_list)} lots x {len(targets)} exits x {len(candles)} candle mode(s) = {n} file(s) will be saved.  Start = {start}  ({"first candle that closes after this" if start_mode == "Now" else "backfilled from that date"})')
+    n = len(symbols) * len(lots_list) * len(qty_list) * len(targets) * len(candles)
+    st.caption(f'{len(symbols)} symbol(s) x {len(lots_list)} lots x {len(qty_list)} qty x {len(targets)} exits x {len(candles)} candle mode(s) = {n} file(s) will be saved.  Start = {start}  (live - first candle that closes after this)')
     st.caption('Live trading (real orders) is not included - run Paper first and check the numbers.')
     if st.button('Start', type='primary'):
         if not folder or not folder.strip():
             st.error('Give a folder name.')
         elif n == 0:
-            st.error('Pick (or type) at least one symbol, one Max lots, one candle option and one exit option.')
+            st.error('Pick (or type) at least one symbol, one Max lots, one quantity, one candle option and one exit option.')
         elif n > 150:
             st.error('Too many files (max 150 at a time).')
         else:
@@ -549,7 +554,7 @@ def page_builder():
             except Exception as e:
                 st.error(str(e))
                 return
-            made, skipped = create_strategies(folder.strip(), prefix.strip(), exchange, symbols, tf, capital, qty,
+            made, skipped = create_strategies(folder.strip(), prefix.strip(), exchange, symbols, tf, capital, qty_list,
                                               close_t.strftime('%H:%M'), lots_list, targets, candles, start)
             if made:
                 st.success(f'Saved {len(made)} file(s) in folder "{folder.strip()}". Open "My strategies" to watch them live.')
