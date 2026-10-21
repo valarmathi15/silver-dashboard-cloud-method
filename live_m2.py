@@ -20,6 +20,7 @@ import datetime as dt
 import json
 import os
 import re
+import threading
 import time
 
 import numpy as np
@@ -201,7 +202,7 @@ def angel_login(client_id, api_key, mpin, totp_secret):
     return smart
 
 
-@st.cache_data(ttl=86400, show_spinner='Loading Angel One instrument list ...')
+@st.cache_resource(ttl=86400, show_spinner='Loading Angel One instrument list ...')
 def _scrip_master():
     return requests.get(SCRIP_URL, timeout=120).json()
 
@@ -216,32 +217,102 @@ def _instrument_token(exchange, symbol):
     return hits[0]['token']
 
 
-def fetch_candles(smart, exchange, symbol, tf, start_date):
-    """-> raw candles (Date, Open, High, Low, Close), tz-naive IST, oldest first."""
-    interval, _, warm_days = TF[tf]
-    token = _instrument_token(exchange, symbol)
-    frm = pd.Timestamp(start_date) - pd.Timedelta(days=warm_days)
-    to = pd.Timestamp.now()
+_RATE_LOCK = threading.Lock()
+_LAST_CALL = [0.0]
+MIN_GAP = 0.7            # seconds between two Angel candle requests (Angel allows ~3/sec; we stay well under)
+RECHECK_SECS = 45        # an already-loaded symbol is only topped up with new candles this often
+
+
+def _is_rate_msg(msg):
+    m = str(msg).lower()
+    return 'access rate' in m or 'exceeding' in m or 'too many' in m or 'rate limit' in m
+
+
+def _call_candle_api(smart, params):
+    """one getCandleData call: spaced out + retried with back-off when Angel says 'exceeding access rate'."""
+    last = 'candle request failed'
+    for i in range(5):
+        with _RATE_LOCK:
+            wait = MIN_GAP - (time.time() - _LAST_CALL[0])
+            if wait > 0:
+                time.sleep(wait)
+            _LAST_CALL[0] = time.time()
+        try:
+            res = smart.getCandleData(params)
+        except Exception as e:
+            last = str(e)
+            if _is_rate_msg(last):
+                time.sleep(2 * (i + 1))
+                continue
+            raise
+        if res and res.get('status'):
+            return res
+        last = (res or {}).get('message', 'candle request failed')
+        if _is_rate_msg(last):
+            time.sleep(2 * (i + 1))
+            continue
+        raise ValueError(last)
+    raise ValueError(f'Angel rate limit: {last}')
+
+
+def _fetch_range(smart, exchange, token, interval, frm, to):
     step = pd.Timedelta(days=1900 if interval == 'ONE_DAY' else 190)   # Angel per-request limits
     rows, cur = [], frm
     while cur < to:
         end = min(cur + step, to)
-        res = smart.getCandleData({'exchange': exchange, 'symboltoken': token, 'interval': interval,
-                                   'fromdate': cur.strftime('%Y-%m-%d %H:%M'),
-                                   'todate': end.strftime('%Y-%m-%d %H:%M')})
-        if not res or not res.get('status'):
-            raise ValueError((res or {}).get('message', 'candle request failed'))
+        res = _call_candle_api(smart, {'exchange': exchange, 'symboltoken': token, 'interval': interval,
+                                       'fromdate': cur.strftime('%Y-%m-%d %H:%M'),
+                                       'todate': end.strftime('%Y-%m-%d %H:%M')})
         rows += res.get('data') or []
         cur = end + pd.Timedelta(minutes=1)
-        time.sleep(0.5)                                                # Angel: ~3 requests/sec
     if not rows:
-        raise ValueError('no candles returned')
+        return pd.DataFrame(columns=['Date', 'Open', 'High', 'Low', 'Close'])
     df = pd.DataFrame(rows, columns=['Date', 'Open', 'High', 'Low', 'Close', 'Volume'])
     df['Date'] = pd.to_datetime(df['Date'])
     if df['Date'].dt.tz is not None:
         df['Date'] = df['Date'].dt.tz_localize(None)
-    df = df[['Date', 'Open', 'High', 'Low', 'Close']].drop_duplicates('Date', keep='last')
-    return df.sort_values('Date').reset_index(drop=True)
+    return df[['Date', 'Open', 'High', 'Low', 'Close']]
+
+
+def fetch_candles(smart, exchange, symbol, tf, start_date):
+    """-> raw candles (Date, Open, High, Low, Close), tz-naive IST, oldest first."""
+    interval, _, warm_days = TF[tf]
+    token = _instrument_token(exchange, symbol)
+    df = _fetch_range(smart, exchange, token, interval, pd.Timestamp(start_date) - pd.Timedelta(days=warm_days), pd.Timestamp.now())
+    if df.empty:
+        raise ValueError('no candles returned')
+    return df.drop_duplicates('Date', keep='last').sort_values('Date').reset_index(drop=True)
+
+
+@st.cache_resource
+def _candle_store():
+    return {'lock': threading.Lock(), 'data': {}}
+
+
+def load_candles(smart, exchange, symbol, tf, start_day):
+    """History is downloaded ONCE per symbol/timeframe; after that only the newest candles are fetched
+    (1 small request, at most every RECHECK_SECS) -> no more 'exceeding access rate'."""
+    S = _candle_store()
+    key = (exchange, symbol, tf, start_day)
+    with S['lock']:
+        e = S['data'].get(key)
+        if e is None:
+            e = S['data'][key] = {'df': fetch_candles(smart, exchange, symbol, tf, start_day),
+                                  'checked': time.time(), 'error': None}
+        elif time.time() - e['checked'] >= RECHECK_SECS:
+            try:
+                interval = TF[tf][0]
+                back = pd.Timedelta(days=5 if interval == 'ONE_DAY' else 2)
+                new = _fetch_range(smart, exchange, _instrument_token(exchange, symbol), interval,
+                                   e['df']['Date'].iloc[-1] - back, pd.Timestamp.now())
+                if not new.empty:
+                    df = pd.concat([e['df'], new]).drop_duplicates('Date', keep='last').sort_values('Date')
+                    e['df'] = df.reset_index(drop=True)
+                e['error'] = None
+            except Exception as ex:                         # keep showing the last good data, retry next refresh
+                e['error'] = str(ex)
+            e['checked'] = time.time()
+        return e['df'].copy(), e['checked'], e['error']
 
 
 # =============================================================== candle preparation
@@ -383,28 +454,26 @@ def create_strategies(folder, prefix, exchange, symbols, tf, capital, qty_list, 
 
 
 # =============================================================== evaluate one saved strategy
-@st.cache_data(ttl=30, show_spinner=False)
-def _load_candles(_smart, cid, exchange, symbol, tf, start_day):
-    return fetch_candles(_smart, exchange, symbol, tf, start_day)   # same symbol/tf/day => one fetch for all files
-
-
 def get_candles(s):
-    cid = st.session_state['creds']['client_id']
+    """-> (raw candles, time of last data check, error text or None)"""
     day = pd.Timestamp(s['start']).normalize().strftime('%Y-%m-%d')
     try:
-        return _load_candles(get_smart(), cid, s['exchange'], s['symbol'], s['tf'], day)
-    except Exception:
-        return _load_candles(relogin(), cid, s['exchange'], s['symbol'], s['tf'], day)   # session expired?
+        return load_candles(get_smart(), s['exchange'], s['symbol'], s['tf'], day)
+    except Exception as e:
+        if _is_rate_msg(e):
+            raise
+        return load_candles(relogin(), s['exchange'], s['symbol'], s['tf'], day)   # session expired?
 
 
 def evaluate(s):
     """-> dict with tr (bar log), trades and the numbers shown in the summary."""
     h, m = [int(x) for x in s['close'].split(':')]
-    raw = get_candles(s)
+    raw, checked, data_err = get_candles(s)
     df = prepare(raw, s['tf'], dt.time(h, m), pd.Timestamp.now())
     tr, trades = compute_m2(df, s.get('profit') or 0.0, int(s['lots']), s['start'], s['qty'],
                             span=s.get('span'), candle=s.get('candle', 'every'))
     out = {'s': s, 'tr': tr, 'trades': trades, 'status': 'Waiting for 1st candle', 'last': None,
+           'checked': checked, 'data_err': data_err,
            'closed_n': 0, 'closed_pnl': 0.0, 'open_pnl': 0.0, 'invested': 0.0}
     if tr.empty:
         return out
@@ -490,31 +559,33 @@ def instrument_choices(exchange):
 def page_builder():
     st.subheader('Strategy builder - Method 2')
     st.caption('Paper trading. Every Symbol x Max lots x Target % you pick is saved as its own file inside the folder.')
+    st.markdown("<style>div[data-testid='stVerticalBlock']{gap:.45rem}"
+                "div[data-testid='stCaptionContainer']{margin-bottom:-.35rem}</style>", unsafe_allow_html=True)
     folders = list_folders()
-    c1, c2 = st.columns(2)
+    c1, c2, c3, c4, c5, c6 = st.columns([1.4, 1.2, 0.9, 1.1, 0.9, 1])      # everything setup-related in ONE row
     with c1:
         pick = st.selectbox('Folder', ['+ New folder'] + folders)
-        folder = st.text_input('New folder name', placeholder='e.g. Nifty 4H test') if pick == '+ New folder' else pick
-    with c2:
-        prefix = st.text_input('File name prefix (optional)', placeholder='e.g. morning')
-    c1, c2, c3 = st.columns(3)
-    exchange = c1.selectbox('Exchange', ['NSE', 'MCX', 'NFO', 'BSE'])
-    capital = c2.number_input('Capital', min_value=0.0, value=1000000.0, step=10000.0)
-    tf = c3.selectbox('Candle timeframe', list(TF))
+    prefix = c2.text_input('File name prefix', placeholder='optional, e.g. morning')
+    exchange = c3.selectbox('Exchange', ['NSE', 'MCX', 'NFO', 'BSE'])
+    capital = c4.number_input('Capital', min_value=0.0, value=1000000.0, step=10000.0)
+    tf = c5.selectbox('Timeframe', list(TF))
+    close_t = c6.time_input('Market close', dt.time(23, 30) if exchange == 'MCX' else dt.time(15, 30), key=f'close_{exchange}')
+    folder = st.text_input('New folder name', placeholder='e.g. Nifty 4H test') if pick == '+ New folder' else pick
 
-    st.markdown('**Entry condition**  - Ichimoku cloud, Method 2')
+    st.markdown('**Entry condition**  - Ichimoku cloud, Method 2 (live: starts from now)')
     picked = []
     groups = list(instrument_choices(exchange).items())
-    if groups:
-        gcols = st.columns(len(groups))                      # Index | Stocks | ... side by side
-        for col, (label, opts) in zip(gcols, groups):
-            with col:
-                st.caption(f'{label} ({len(opts)})')
-                picked += checkbox_dropdown(f'Select {label.lower()}', opts, [], f'sym_{exchange}_{label}')
-    typed_txt = st.text_input('Or type names (comma separated)', placeholder='e.g. Nifty 50, RELIANCE, GOLDM05DEC25FUT',
-                              help='Index: Nifty 50  |  Stock: RELIANCE (or RELIANCE-EQ)  |  MCX: exact future symbol. '
-                                   'Typed names are added to the ticked ones.')
-    c1, c2, c3 = st.columns(3)                               # Max lots | Quantity per lot | Candle in ONE row
+    cols = st.columns(len(groups) + 1)                        # Index | Stocks | type names  - ONE row
+    for col, (label, opts) in zip(cols, groups):
+        with col:
+            st.caption(f'{label} ({len(opts)})')
+            picked += checkbox_dropdown(f'Select {label.lower()}', opts, [], f'sym_{exchange}_{label}')
+    with cols[-1]:
+        st.caption('Or type names (comma separated)')
+        typed_txt = st.text_input('Or type names', label_visibility='collapsed', placeholder='Nifty 50, RELIANCE, GOLDM05DEC25FUT',
+                                  help='Index: Nifty 50  |  Stock: RELIANCE (or RELIANCE-EQ)  |  MCX: exact future symbol. '
+                                       'Typed names are added to the ticked ones.')
+    c1, c2, c3, c4 = st.columns(4)                            # Max lots | Qty | Candle | Exit  - ONE row
     with c1:
         st.caption('Max lots (one file each)')
         lots_list = checkbox_dropdown('Select Max lots', LOTS_OPTIONS, [10], 'lots')
@@ -524,12 +595,9 @@ def page_builder():
     with c3:
         st.caption('Buy on (one file each)')
         candles = checkbox_dropdown('Select candle', list(CANDLE_OPTIONS), ['Every candle'], 'candle')
-    c1, c2 = st.columns([3, 1])                              # Exit | Market close in ONE row
-    with c1:
-        st.caption(f'Profit target / Span exit ({len(EXIT_OPTIONS)})  (one file each)')
+    with c4:
+        st.caption(f'Profit target / Span exit ({len(EXIT_OPTIONS)}) (one file each)')
         targets = checkbox_dropdown('Select profit target / span exit', EXIT_OPTIONS, [1, 2], 'exits', fmt=exit_label)
-    with c2:
-        close_t = st.time_input('Market close', dt.time(23, 30) if exchange == 'MCX' else dt.time(15, 30), key=f'close_{exchange}')
     start = pd.Timestamp.now().strftime('%Y-%m-%d %H:%M')    # live only: always start from NOW (no past backfill)
 
     symbols, seen = [], set()
@@ -609,16 +677,57 @@ def page_view(topic, refresh):
             return
         view = st.radio('View', ['Folder summary', 'Open file(s)'], horizontal=True)
         strategies = [load_strategy(folder, f) for f in files]
-        evs = {}
+        evs, errs = {}, {}
         for f, s in zip(files, strategies):
             try:
                 evs[f] = evaluate(s)
             except Exception as e:
-                st.error(f"{s['name']}: {e}")
+                errs[s['name']] = str(e)
         for f, ev in evs.items():                                  # push alert on a NEW closed-candle signal
             if ev['last'] is not None:
                 notify_new_signal(topic, f"{st.session_state['creds']['client_id']}/{folder}/{f}", ev['last'])
-        st.caption(f"Refreshed {dt.datetime.now():%H:%M:%S}  |  closed candles only  |  every {refresh}s")
+
+        # ---- live status banner: shows the app is really running
+        now = dt.datetime.now()
+        close_txt = strategies[0].get('close', '15:30')
+        open_txt = '09:00' if strategies[0]['exchange'] == 'MCX' else '09:15'
+        is_open = now.weekday() < 5 and open_txt <= now.strftime('%H:%M') <= close_txt
+        stale = [ev for ev in evs.values() if ev.get('data_err')]
+        ok = not (errs or stale)
+        b1, b2, b3, b4 = st.columns(4)
+        b1.metric('Status', 'LIVE - market open' if is_open else 'LIVE - market closed',
+                  'running' if ok else 'check warnings', delta_color='off' if ok else 'inverse')
+        b2.metric('Last refresh', now.strftime('%H:%M:%S'), f'next in {int(refresh)}s', delta_color='off')
+        checks = [ev['checked'] for ev in evs.values() if ev.get('checked')]
+        b3.metric('Angel data checked', dt.datetime.fromtimestamp(max(checks)).strftime('%H:%M:%S') if checks else '-',
+                  f'{len(evs)} / {len(files)} files OK', delta_color='off')
+        n_sig = sum(int((ev['tr']['Signal'] != 'HOLD').sum()) for ev in evs.values() if not ev['tr'].empty)
+        b4.metric('Signals since start', n_sig)
+        if stale:
+            st.warning('Angel rate limit / data problem - showing the last good candles, will retry on the next refresh: '
+                       + (stale[0]['data_err'] or '')[:150])
+        if errs:
+            with st.expander(f'{len(errs)} file(s) could not be evaluated', expanded=False):
+                for n_, m_ in errs.items():
+                    st.write(f'**{n_}**: {m_[:200]}')
+
+        # ---- live activity feed (every BUY / EXIT since the strategies started)
+        acts = []
+        for f, ev in evs.items():
+            tr = ev['tr']
+            if tr.empty:
+                continue
+            for _, r in tr[tr['Signal'] != 'HOLD'].iterrows():
+                acts.append({'Bar time': str(r['Date'])[:16], 'File': ev['s']['name'], 'Signal': r['Signal'],
+                             'Price': round(float(r['Close']), 2), 'Lots after': int(r['Lots'])})
+        with st.expander(f'Live activity - {len(acts)} signal(s) since start', expanded=True):
+            if acts:
+                st.dataframe(pd.DataFrame(acts).sort_values('Bar time', ascending=False).head(100),
+                             width='stretch', hide_index=True)
+            else:
+                st.info('No signal yet. Strategies started at ' + min(s['start'] for s in strategies) +
+                        ' - they act only when a candle CLOSES after that time (cloud history is loaded automatically).')
+        st.caption(f"Refreshed {now:%H:%M:%S}  |  closed candles only  |  every {refresh}s")
 
         if view == 'Folder summary':
             rows = []
@@ -631,7 +740,9 @@ def page_view(topic, refresh):
                              'Open P&L': ev['open_pnl'], 'Closed trades': ev['closed_n'],
                              'Closed P&L': ev['closed_pnl'], 'Total P&L': ev['closed_pnl'] + ev['open_pnl'],
                              'Last signal': '-' if last is None else last['Signal'],
-                             'Last bar': '-' if last is None else str(last['Date'])[:16]})
+                             'Last bar': '-' if last is None else str(last['Date'])[:16],
+                             'Started': s['start'],
+                             'Data checked': dt.datetime.fromtimestamp(ev['checked']).strftime('%H:%M:%S') if ev.get('checked') else '-'})
             if rows:
                 tot = sum(r['Total P&L'] for r in rows)
                 st.metric('Folder total P&L (all files)', money(tot))
