@@ -20,6 +20,7 @@ import datetime as dt
 import json
 import os
 import re
+import shutil
 import threading
 import time
 
@@ -409,6 +410,12 @@ def list_folders():
     return sorted(f for f in os.listdir(d) if os.path.isdir(os.path.join(d, f))) if os.path.isdir(d) else []
 
 
+def delete_folder(folder):
+    d = os.path.join(user_dir(), safe(folder))
+    if os.path.isdir(d):
+        shutil.rmtree(d)
+
+
 def list_files(folder):
     d = os.path.join(user_dir(), safe(folder))
     return sorted(f for f in os.listdir(d) if f.endswith('.json')) if os.path.isdir(d) else []
@@ -592,6 +599,15 @@ def page_builder():
     with c2:
         st.caption('Quantity per lot (one file each)')
         qty_list = [float(q) for q in checkbox_dropdown('Select quantity', QTY_OPTIONS, [1], 'qty')]
+        qty_txt = st.text_input('Or type quantity', label_visibility='collapsed', placeholder='or type: 3, 15, 40',
+                                help='Any quantity you type (comma separated) is added to the ticked ones.')
+        for x in qty_txt.split(','):
+            try:
+                v = float(x.strip())
+            except ValueError:
+                continue
+            if v > 0 and v not in qty_list:
+                qty_list.append(v)
     with c3:
         st.caption('Buy on (one file each)')
         candles = checkbox_dropdown('Select candle', list(CANDLE_OPTIONS), ['Every candle'], 'candle')
@@ -672,6 +688,12 @@ def page_view(topic, refresh):
             return
         folder = st.selectbox('Folder', folders)
         files = list_files(folder)
+        with st.expander('Delete this folder', expanded=False):
+            st.write(f'Folder "{folder}" and the {len(files)} file(s) inside it will be deleted permanently.')
+            if st.checkbox('Yes, delete the whole folder', key=f'delf_{folder}'):
+                if st.button('Delete folder', key=f'delfbtn_{folder}'):
+                    delete_folder(folder)
+                    st.rerun()
         if not files:
             st.info('This folder is empty.')
             return
