@@ -766,23 +766,28 @@ def page_view(topic, refresh):
         st.caption('Click a folder to watch its strategies run live.')
         for fol in folders:
             n = len(list_files(fol))
-            if st.button(f'📁  {fol}      |      {n} strateg{"y" if n == 1 else "ies"}', key=f'open_{fol}', width='stretch'):
+            row = st.columns([14, 1])
+            if row[0].button(f'📁  {fol}      |      {n} strateg{"y" if n == 1 else "ies"}', key=f'open_{fol}', width='stretch'):
                 st.session_state['open_folder'] = fol
                 st.rerun()
+            with row[1].popover('🗑️', width='stretch'):          # icon only; one more click to confirm
+                st.write(f'{fol} ({n})')
+                if st.button('✔ Yes', key=f'delfbtn_{fol}', type='primary'):
+                    delete_folder(fol)
+                    st.rerun()
         return
 
-    top = st.columns([1, 5])                                      # ---- inside one folder
+    top = st.columns([1.3, 8, 0.7])                               # ---- inside one folder
     if top[0].button('← All folders'):
         st.session_state.pop('open_folder', None)
         st.rerun()
     top[1].markdown(f'#### 📁 {folder}')
-    with st.expander('Delete this folder', expanded=False):
-        st.write(f'Folder "{folder}" and the {len(list_files(folder))} file(s) inside it will be deleted permanently.')
-        if st.checkbox('Yes, delete the whole folder', key=f'delf_{folder}'):
-            if st.button('Delete folder', key=f'delfbtn_{folder}'):
-                delete_folder(folder)
-                st.session_state.pop('open_folder', None)
-                st.rerun()
+    with top[2].popover('🗑️', width='stretch'):
+        st.write(f'{folder} ({len(list_files(folder))})')
+        if st.button('✔ Yes', key=f'delfbtn_in_{folder}', type='primary'):
+            delete_folder(folder)
+            st.session_state.pop('open_folder', None)
+            st.rerun()
     _folder_live(topic, refresh, folder)
 
 
@@ -870,8 +875,8 @@ def _folder_live(topic, refresh, folder):
                 c[4].write(money(total))
                 with st.expander('Live details'):                  # constant label -> stays open while it auto-refreshes
                     detail(ev)
-                    if st.checkbox('Delete this file', key=f'del_{folder}_{f}'):
-                        if st.button('Confirm delete', key=f'delbtn_{folder}_{f}'):
+                    with st.popover('🗑️'):
+                        if st.button('✔ Yes', key=f'delbtn_{folder}_{f}', type='primary'):
                             delete_strategy(folder, f)
                             st.rerun()
 
