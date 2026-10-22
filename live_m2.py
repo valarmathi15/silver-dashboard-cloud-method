@@ -35,10 +35,19 @@ STATE_FILE = os.path.join(HERE, 'last_signal.json')
 
 # timeframe -> (Angel interval, raw bar length, warm-up calendar days needed for the cloud)
 TF = {
-    '1D': ('ONE_DAY',  pd.Timedelta(days=1),   260),
-    '4H': ('ONE_HOUR', pd.Timedelta(hours=1),  160),   # 4H = 4 hourly bars, built per day
-    '1H': ('ONE_HOUR', pd.Timedelta(hours=1),  100),
+    '1D':  ('ONE_DAY',        pd.Timedelta(days=1),      260),
+    '4H':  ('ONE_HOUR',       pd.Timedelta(hours=1),     160),   # 4H = 4 hourly bars, built per day
+    '1H':  ('ONE_HOUR',       pd.Timedelta(hours=1),     100),
+    '30m': ('THIRTY_MINUTE',  pd.Timedelta(minutes=30),  25),
+    '15m': ('FIFTEEN_MINUTE', pd.Timedelta(minutes=15),  14),
+    '10m': ('TEN_MINUTE',     pd.Timedelta(minutes=10),  10),
+    '5m':  ('FIVE_MINUTE',    pd.Timedelta(minutes=5),   7),
+    '3m':  ('THREE_MINUTE',   pd.Timedelta(minutes=3),   5),
+    '1m':  ('ONE_MINUTE',     pd.Timedelta(minutes=1),   5),
 }
+# max days Angel returns per getCandleData request (kept a bit under the real limit)
+INTERVAL_MAX_DAYS = {'ONE_DAY': 1900, 'ONE_HOUR': 380, 'THIRTY_MINUTE': 190, 'FIFTEEN_MINUTE': 190,
+                     'TEN_MINUTE': 95, 'FIVE_MINUTE': 95, 'THREE_MINUTE': 55, 'ONE_MINUTE': 28}
 LOTS_OPTIONS = [10, 20, 30, 40, 50, 60, 70, 80, 90, 100]
 TARGET_OPTIONS = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
 SPAN_OPTIONS = {'SPAN A': 'A', 'SPAN B': 'B', 'SPAN A & B': 'A&B', 'SPAN A OR B': 'AorB'}
@@ -256,7 +265,7 @@ def _call_candle_api(smart, params):
 
 
 def _fetch_range(smart, exchange, token, interval, frm, to):
-    step = pd.Timedelta(days=1900 if interval == 'ONE_DAY' else 190)   # Angel per-request limits
+    step = pd.Timedelta(days=INTERVAL_MAX_DAYS.get(interval, 28))      # Angel per-request limits
     rows, cur = [], frm
     while cur < to:
         end = min(cur + step, to)
@@ -565,61 +574,88 @@ def instrument_choices(exchange):
 def page_builder():
     st.subheader('Strategy builder - Method 2')
     st.caption('Paper trading. Every Symbol x Max lots x Target % you pick is saved as its own file inside the folder.')
-    st.markdown("<style>div[data-testid='stVerticalBlock']{gap:.45rem}"
-                "div[data-testid='stCaptionContainer']{margin-bottom:-.35rem}</style>", unsafe_allow_html=True)
+    st.markdown("<style>div[data-testid='stVerticalBlock']{gap:.5rem}</style>", unsafe_allow_html=True)
+
+    def lbl(text):                                            # same label look for EVERY field -> rows line up
+        st.markdown(f"<div style='font-size:14px;line-height:1.4;margin:0 0 2px 0;opacity:.85'>{text}</div>", unsafe_allow_html=True)
+
     folders = list_folders()
-    c1, c2, c3, c4, c5, c6 = st.columns([1.4, 1.2, 0.9, 1.1, 0.9, 1])      # everything setup-related in ONE row
+    c1, c2, c3, c4 = st.columns(4)                            # ---- row 1
     with c1:
-        pick = st.selectbox('Folder', ['+ New folder'] + folders)
-    prefix = c2.text_input('File name prefix', placeholder='optional, e.g. morning')
-    exchange = c3.selectbox('Exchange', ['NSE', 'MCX', 'NFO', 'BSE'])
-    capital = c4.number_input('Capital', min_value=0.0, value=1000000.0, step=10000.0)
-    tf = c5.selectbox('Timeframe', list(TF))
-    close_t = c6.time_input('Market close', dt.time(23, 30) if exchange == 'MCX' else dt.time(15, 30), key=f'close_{exchange}')
-    folder = st.text_input('New folder name', placeholder='e.g. Nifty 4H test') if pick == '+ New folder' else pick
+        lbl('Folder')
+        pick = st.selectbox('Folder', ['+ New folder'] + folders, label_visibility='collapsed')
+    with c2:
+        lbl('New folder name')
+        new_name = st.text_input('New folder name', label_visibility='collapsed', placeholder='e.g. Nifty 4H test',
+                                 disabled=(pick != '+ New folder'))
+    with c3:
+        lbl('File name prefix')
+        prefix = st.text_input('File name prefix', label_visibility='collapsed', placeholder='optional, e.g. morning')
+    with c4:
+        lbl('Exchange')
+        exchange = st.selectbox('Exchange', ['NSE', 'MCX', 'NFO', 'BSE'], label_visibility='collapsed')
+    folder = new_name if pick == '+ New folder' else pick
+
+    c1, c2, c3, c4 = st.columns(4)                            # ---- row 2
+    with c1:
+        lbl('Capital')
+        capital = st.number_input('Capital', min_value=0.0, value=1000000.0, step=10000.0, label_visibility='collapsed')
+    with c2:
+        lbl('Timeframe')
+        tf = st.selectbox('Timeframe', list(TF), label_visibility='collapsed')
+    with c3:
+        lbl('Market close')
+        close_t = st.time_input('Market close', dt.time(23, 30) if exchange == 'MCX' else dt.time(15, 30),
+                                key=f'close_{exchange}', label_visibility='collapsed')
+    with c4:
+        lbl('Buy on (one file each)')
+        candles = checkbox_dropdown('Select candle', list(CANDLE_OPTIONS), ['Every candle'], 'candle')
 
     st.markdown('**Entry condition**  - Ichimoku cloud, Method 2 (live: starts from now)')
     picked = []
     groups = list(instrument_choices(exchange).items())
-    cols = st.columns(len(groups) + 1)                        # Index | Stocks | type names  - ONE row
+    cols = st.columns(len(groups) + 1)                        # ---- row 3: Index | Stocks | type names
     for col, (label, opts) in zip(cols, groups):
         with col:
-            st.caption(f'{label} ({len(opts)})')
+            lbl(f'{label} ({len(opts)})')
             picked += checkbox_dropdown(f'Select {label.lower()}', opts, [], f'sym_{exchange}_{label}')
     with cols[-1]:
-        st.caption('Or type names (comma separated)')
+        lbl('Or type names (comma separated)')
         typed_txt = st.text_input('Or type names', label_visibility='collapsed', placeholder='Nifty 50, RELIANCE, GOLDM05DEC25FUT',
                                   help='Index: Nifty 50  |  Stock: RELIANCE (or RELIANCE-EQ)  |  MCX: exact future symbol. '
                                        'Typed names are added to the ticked ones.')
-    c1, c2, c3, c4 = st.columns(4)                            # Max lots | Qty | Candle | Exit  - ONE row
+
+    c1, c2, c3, c4, c5 = st.columns([1, 1, 1.2, 1.2, 1.2])   # ---- row 4: lots | size mode | size values | type | exit
     with c1:
-        st.caption('Max lots (one file each)')
-        lots_list = checkbox_dropdown('Select Max lots', LOTS_OPTIONS, [10], 'lots')
+        lbl('Max lots')
+        lots_list = checkbox_dropdown('Select lots', LOTS_OPTIONS, [10], 'lots')
     with c2:
-        mode = st.radio('Each lot by', ['Quantity', 'Amount'], horizontal=True, label_visibility='collapsed')
-        if mode == 'Quantity':
-            vals = [float(q) for q in checkbox_dropdown('Select quantity per lot', QTY_OPTIONS, [1], 'qty')]
-            kind, ph = 'qty', 'or type quantity: 3, 15, 40'
-        else:
-            vals = [float(q) for q in checkbox_dropdown('Select amount per lot', AMOUNT_OPTIONS, [10000], 'amt')]
-            kind, ph = 'amt', 'or type amount: 15000, 75000'
-        size_txt = st.text_input('Or type', label_visibility='collapsed', placeholder=ph, key=f'size_txt_{kind}',
-                                 help='Comma separated. Typed values are added to the ticked ones, one file each. '
-                                      'Amount = money put in every lot (units = amount / price of that lot).')
-        for x in size_txt.split(','):
-            try:
-                v = float(x.strip())
-            except ValueError:
-                continue
-            if v > 0 and v not in vals:
-                vals.append(v)
-        sizes = [(kind, v) for v in vals]
+        lbl('Size each lot by')
+        mode = st.selectbox('Size each lot by', ['Quantity', 'Amount'], label_visibility='collapsed')
+    kind = 'qty' if mode == 'Quantity' else 'amt'
     with c3:
-        st.caption('Buy on (one file each)')
-        candles = checkbox_dropdown('Select candle', list(CANDLE_OPTIONS), ['Every candle'], 'candle')
+        lbl(f'{mode} per lot')
+        if kind == 'qty':
+            vals = [float(q) for q in checkbox_dropdown('Select quantity', QTY_OPTIONS, [1], 'qty')]
+        else:
+            vals = [float(q) for q in checkbox_dropdown('Select amount', AMOUNT_OPTIONS, [10000], 'amt')]
     with c4:
-        st.caption(f'Profit target / Span exit ({len(EXIT_OPTIONS)}) (one file each)')
-        targets = checkbox_dropdown('Select profit target / span exit', EXIT_OPTIONS, [1, 2], 'exits', fmt=exit_label)
+        lbl(f'Or type {mode.lower()}')
+        size_txt = st.text_input('Or type', label_visibility='collapsed',
+                                 placeholder='3, 15, 40' if kind == 'qty' else '15000, 75000', key=f'size_txt_{kind}',
+                                 help='Comma separated; added to the ticked ones, one file each. '
+                                      'Amount = money put in every lot (units = amount / price of that lot).')
+    for x in size_txt.split(','):
+        try:
+            v = float(x.strip())
+        except ValueError:
+            continue
+        if v > 0 and v not in vals:
+            vals.append(v)
+    sizes = [(kind, v) for v in vals]
+    with c5:
+        lbl(f'Profit target / Span exit ({len(EXIT_OPTIONS)})')
+        targets = checkbox_dropdown('Select exit', EXIT_OPTIONS, [1, 2], 'exits', fmt=exit_label)
     start = pd.Timestamp.now().strftime('%Y-%m-%d %H:%M')    # live only: always start from NOW (no past backfill)
 
     symbols, seen = [], set()
