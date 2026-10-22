@@ -438,12 +438,13 @@ def delete_strategy(folder, fname):
     os.remove(os.path.join(user_dir(), safe(folder), fname))
 
 
-def create_strategies(folder, prefix, exchange, symbols, tf, capital, sizes, close, lots_list, exits, candles, start):
-    """one file per symbol x lots x exit option x candle mode. Existing file is NOT overwritten (keeps its start time)."""
+def create_strategies(folder, prefix, exchange, symbols, tfs, capital, sizes, close, lots_list, exits, candles, start):
+    """one file per symbol x timeframe x lots x size x exit option x candle mode. Existing file is NOT overwritten (keeps its start time)."""
     d = os.path.join(user_dir(), safe(folder))
     os.makedirs(d, exist_ok=True)
     made, skipped = [], []
     for sym in symbols:
+      for tf in tfs:
         for lots in lots_list:
           for kind, val in sizes:
             for ex in exits:
@@ -574,10 +575,16 @@ def instrument_choices(exchange):
 def page_builder():
     st.subheader('Strategy builder - Method 2')
     st.caption('Paper trading. Every Symbol x Max lots x Target % you pick is saved as its own file inside the folder.')
-    st.markdown("<style>div[data-testid='stVerticalBlock']{gap:.5rem}</style>", unsafe_allow_html=True)
+    st.markdown("""<style>
+    div[data-testid='stVerticalBlock']{gap:.6rem}
+    /* check-box drop-downs look exactly like the other inputs (same grey, same height) */
+    div[data-testid='stPopover'] button{background:rgba(151,166,195,.15);border:1px solid transparent;
+        min-height:2.5rem;border-radius:.5rem}
+    div[data-testid='stPopover'] button:hover{border-color:rgba(255,75,75,.6)}
+    </style>""", unsafe_allow_html=True)
 
     def lbl(text):                                            # same label look for EVERY field -> rows line up
-        st.markdown(f"<div style='font-size:14px;line-height:1.4;margin:0 0 2px 0;opacity:.85'>{text}</div>", unsafe_allow_html=True)
+        st.markdown(f"<div style='font-size:14px;line-height:1.5;padding:0 0 10px 0;opacity:.85'>{text}</div>", unsafe_allow_html=True)
 
     folders = list_folders()
     c1, c2, c3, c4 = st.columns(4)                            # ---- row 1
@@ -601,8 +608,8 @@ def page_builder():
         lbl('Capital')
         capital = st.number_input('Capital', min_value=0.0, value=1000000.0, step=10000.0, label_visibility='collapsed')
     with c2:
-        lbl('Timeframe')
-        tf = st.selectbox('Timeframe', list(TF), label_visibility='collapsed')
+        lbl('Timeframe (one file each)')
+        tfs = checkbox_dropdown('Select timeframe', list(TF), ['1D'], 'tf')
     with c3:
         lbl('Market close')
         close_t = st.time_input('Market close', dt.time(23, 30) if exchange == 'MCX' else dt.time(15, 30),
@@ -625,37 +632,49 @@ def page_builder():
                                   help='Index: Nifty 50  |  Stock: RELIANCE (or RELIANCE-EQ)  |  MCX: exact future symbol. '
                                        'Typed names are added to the ticked ones.')
 
-    c1, c2, c3, c4, c5 = st.columns([1, 1, 1.2, 1.2, 1.2])   # ---- row 4: lots | size mode | size values | type | exit
+    c1, c2, c3, c4 = st.columns(4)                            # ---- row 4: lots | size by | exit
     with c1:
-        lbl('Max lots')
+        lbl('Max lots (one file each)')
         lots_list = checkbox_dropdown('Select lots', LOTS_OPTIONS, [10], 'lots')
     with c2:
         lbl('Size each lot by')
-        mode = st.selectbox('Size each lot by', ['Quantity', 'Amount'], label_visibility='collapsed')
-    kind = 'qty' if mode == 'Quantity' else 'amt'
+        modes = checkbox_dropdown('Select size type', ['Quantity', 'Amount'], ['Quantity'], 'mode')
     with c3:
-        lbl(f'{mode} per lot')
-        if kind == 'qty':
-            vals = [float(q) for q in checkbox_dropdown('Select quantity', QTY_OPTIONS, [1], 'qty')]
-        else:
-            vals = [float(q) for q in checkbox_dropdown('Select amount', AMOUNT_OPTIONS, [10000], 'amt')]
-    with c4:
-        lbl(f'Or type {mode.lower()}')
-        size_txt = st.text_input('Or type', label_visibility='collapsed',
-                                 placeholder='3, 15, 40' if kind == 'qty' else '15000, 75000', key=f'size_txt_{kind}',
-                                 help='Comma separated; added to the ticked ones, one file each. '
-                                      'Amount = money put in every lot (units = amount / price of that lot).')
-    for x in size_txt.split(','):
-        try:
-            v = float(x.strip())
-        except ValueError:
-            continue
-        if v > 0 and v not in vals:
-            vals.append(v)
-    sizes = [(kind, v) for v in vals]
-    with c5:
         lbl(f'Profit target / Span exit ({len(EXIT_OPTIONS)})')
         targets = checkbox_dropdown('Select exit', EXIT_OPTIONS, [1, 2], 'exits', fmt=exit_label)
+
+    def typed_values(txt):
+        out = []
+        for x in txt.split(','):
+            try:
+                v = float(x.strip())
+            except ValueError:
+                continue
+            if v > 0 and v not in out:
+                out.append(v)
+        return out
+
+    sizes = []
+    slots = st.columns(4)                                     # ---- row 5: values for the chosen size type(s)
+    i = 0
+    if 'Quantity' in modes:
+        with slots[i]:
+            lbl('Quantity per lot')
+            qv = [float(q) for q in checkbox_dropdown('Select quantity', QTY_OPTIONS, [1], 'qty')]
+        with slots[i + 1]:
+            lbl('Or type quantity')
+            qt = st.text_input('Or type quantity', label_visibility='collapsed', placeholder='3, 15, 40', key='size_txt_qty')
+        sizes += [('qty', v) for v in dict.fromkeys(qv + typed_values(qt))]
+        i += 2
+    if 'Amount' in modes:
+        with slots[i]:
+            lbl('Amount per lot')
+            av = [float(q) for q in checkbox_dropdown('Select amount', AMOUNT_OPTIONS, [10000], 'amt')]
+        with slots[i + 1]:
+            lbl('Or type amount')
+            at = st.text_input('Or type amount', label_visibility='collapsed', placeholder='15000, 75000', key='size_txt_amt',
+                               help='Money put in every lot (units = amount / price of that lot).')
+        sizes += [('amt', v) for v in dict.fromkeys(av + typed_values(at))]
     start = pd.Timestamp.now().strftime('%Y-%m-%d %H:%M')    # live only: always start from NOW (no past backfill)
 
     symbols, seen = [], set()
@@ -663,14 +682,15 @@ def page_builder():
         if x.upper() not in seen:
             seen.add(x.upper())
             symbols.append(x)
-    n = len(symbols) * len(lots_list) * len(sizes) * len(targets) * len(candles)
-    st.caption(f'{len(symbols)} symbol(s) x {len(lots_list)} lots x {len(sizes)} {'qty' if kind == 'qty' else 'amount'} x {len(targets)} exits x {len(candles)} candle mode(s) = {n} file(s) will be saved.  Start = {start}  (live - first candle that closes after this)')
+    n = len(symbols) * len(tfs) * len(lots_list) * len(sizes) * len(targets) * len(candles)
+    st.caption(f'{len(symbols)} symbol(s) x {len(tfs)} timeframe(s) x {len(lots_list)} lots x {len(sizes)} size(s) x {len(targets)} exits x '
+               f'{len(candles)} candle mode(s) = {n} file(s) will be saved.  Start = {start}  (live - first candle that closes after this)')
     st.caption('Live trading (real orders) is not included - run Paper first and check the numbers.')
     if st.button('Start', type='primary'):
         if not folder or not folder.strip():
             st.error('Give a folder name.')
         elif n == 0:
-            st.error('Pick (or type) at least one symbol, one Max lots, one quantity/amount, one candle option and one exit option.')
+            st.error('Pick (or type) at least one symbol, one timeframe, one Max lots, one quantity/amount, one candle option and one exit option.')
         elif n > 150:
             st.error('Too many files (max 150 at a time).')
         else:
@@ -680,7 +700,7 @@ def page_builder():
             except Exception as e:
                 st.error(str(e))
                 return
-            made, skipped = create_strategies(folder.strip(), prefix.strip(), exchange, symbols, tf, capital, sizes,
+            made, skipped = create_strategies(folder.strip(), prefix.strip(), exchange, symbols, tfs, capital, sizes,
                                               close_t.strftime('%H:%M'), lots_list, targets, candles, start)
             if made:
                 st.success(f'Saved {len(made)} file(s) in folder "{folder.strip()}". Open "My strategies" to watch them live.')
