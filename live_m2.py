@@ -34,6 +34,15 @@ STRAT_ROOT = os.path.join(HERE, 'strategies')
 STATE_FILE = os.path.join(HERE, 'last_signal.json')
 
 # timeframe -> (Angel interval, raw bar length, warm-up calendar days needed for the cloud)
+def now_ist():
+    """current India time as a naive Timestamp - the server (e.g. Streamlit Cloud) may run in UTC, Angel candles are IST."""
+    return pd.Timestamp.now(tz='Asia/Kolkata').tz_localize(None)
+
+
+def ts_ist(epoch):
+    return pd.Timestamp(epoch, unit='s', tz='UTC').tz_convert('Asia/Kolkata').tz_localize(None)
+
+
 TF = {
     '1D':  ('ONE_DAY',        pd.Timedelta(days=1),      260),
     '4H':  ('ONE_HOUR',       pd.Timedelta(hours=1),     160),   # 4H = 4 hourly bars, built per day
@@ -287,7 +296,7 @@ def fetch_candles(smart, exchange, symbol, tf, start_date):
     """-> raw candles (Date, Open, High, Low, Close), tz-naive IST, oldest first."""
     interval, _, warm_days = TF[tf]
     token = _instrument_token(exchange, symbol)
-    df = _fetch_range(smart, exchange, token, interval, pd.Timestamp(start_date) - pd.Timedelta(days=warm_days), pd.Timestamp.now())
+    df = _fetch_range(smart, exchange, token, interval, pd.Timestamp(start_date) - pd.Timedelta(days=warm_days), now_ist())
     if df.empty:
         raise ValueError('no candles returned')
     return df.drop_duplicates('Date', keep='last').sort_values('Date').reset_index(drop=True)
@@ -313,7 +322,7 @@ def load_candles(smart, exchange, symbol, tf, start_day):
                 interval = TF[tf][0]
                 back = pd.Timedelta(days=5 if interval == 'ONE_DAY' else 2)
                 new = _fetch_range(smart, exchange, _instrument_token(exchange, symbol), interval,
-                                   e['df']['Date'].iloc[-1] - back, pd.Timestamp.now())
+                                   e['df']['Date'].iloc[-1] - back, now_ist())
                 if not new.empty:
                     df = pd.concat([e['df'], new]).drop_duplicates('Date', keep='last').sort_values('Date')
                     e['df'] = df.reset_index(drop=True)
@@ -462,7 +471,7 @@ def create_strategies(folder, prefix, exchange, symbols, tfs, capital, sizes, cl
                          'tf': tf, 'profit': None if is_span else ex, 'span': SPAN_OPTIONS.get(ex),
                          'exit_label': exit_label(ex), 'candle': cdc, 'lots': lots, 'capital': capital,
                          'qty': val if kind == 'qty' else 1.0, 'amount': val if kind == 'amt' else None, 'close': close, 'start': start,
-                         'created': dt.datetime.now().strftime('%Y-%m-%d %H:%M')}
+                         'created': now_ist().to_pydatetime().strftime('%Y-%m-%d %H:%M')}
                     with open(path, 'w', encoding='utf-8') as f:
                         json.dump(s, f, indent=1)
                     made.append(name)
@@ -485,7 +494,7 @@ def evaluate(s):
     """-> dict with tr (bar log), trades and the numbers shown in the summary."""
     h, m = [int(x) for x in s['close'].split(':')]
     raw, checked, data_err = get_candles(s)
-    df = prepare(raw, s['tf'], dt.time(h, m), pd.Timestamp.now())
+    df = prepare(raw, s['tf'], dt.time(h, m), now_ist())
     tr, trades = compute_m2(df, s.get('profit') or 0.0, int(s['lots']), s['start'], s['qty'],
                             span=s.get('span'), candle=s.get('candle', 'every'), amount=s.get('amount'))
     out = {'s': s, 'tr': tr, 'trades': trades, 'status': 'Waiting for 1st candle', 'last': None,
@@ -557,7 +566,7 @@ def instrument_choices(exchange):
         if st_:
             out['Stocks'] = st_
     if exchange == 'MCX':
-        today, best = dt.datetime.now(), {}
+        today, best = now_ist().to_pydatetime(), {}
         for r in rows:
             if r.get('instrumenttype') != 'FUTCOM':
                 continue
@@ -675,7 +684,7 @@ def page_builder():
             at = st.text_input('Or type amount', label_visibility='collapsed', placeholder='15000, 75000', key='size_txt_amt',
                                help='Money put in every lot (units = amount / price of that lot).')
         sizes += [('amt', v) for v in dict.fromkeys(av + typed_values(at))]
-    start = pd.Timestamp.now().strftime('%Y-%m-%d %H:%M')    # live only: always start from NOW (no past backfill)
+    start = now_ist().strftime('%Y-%m-%d %H:%M')    # live only: always start from NOW (no past backfill)
 
     symbols, seen = [], set()
     for x in picked + [t.strip() for t in typed_txt.split(',') if t.strip()]:
@@ -743,19 +752,43 @@ def detail(ev):
 
 
 def page_view(topic, refresh):
+    folders = list_folders()
+    if not folders:
+        st.info('No strategies yet. Create some in the Builder.')
+        return
+    folder = st.session_state.get('open_folder')
+    if folder not in folders:
+        st.session_state.pop('open_folder', None)
+        folder = None
+
+    if folder is None:                                            # ---- folder list: click a folder to open it
+        st.markdown('#### Your folders')
+        st.caption('Click a folder to watch its strategies run live.')
+        for fol in folders:
+            n = len(list_files(fol))
+            if st.button(f'📁  {fol}      |      {n} strateg{"y" if n == 1 else "ies"}', key=f'open_{fol}', width='stretch'):
+                st.session_state['open_folder'] = fol
+                st.rerun()
+        return
+
+    top = st.columns([1, 5])                                      # ---- inside one folder
+    if top[0].button('← All folders'):
+        st.session_state.pop('open_folder', None)
+        st.rerun()
+    top[1].markdown(f'#### 📁 {folder}')
+    with st.expander('Delete this folder', expanded=False):
+        st.write(f'Folder "{folder}" and the {len(list_files(folder))} file(s) inside it will be deleted permanently.')
+        if st.checkbox('Yes, delete the whole folder', key=f'delf_{folder}'):
+            if st.button('Delete folder', key=f'delfbtn_{folder}'):
+                delete_folder(folder)
+                st.session_state.pop('open_folder', None)
+                st.rerun()
+    _folder_live(topic, refresh, folder)
+
+
+def _folder_live(topic, refresh, folder):
     def body():
-        folders = list_folders()
-        if not folders:
-            st.info('No strategies yet. Create some in the Builder.')
-            return
-        folder = st.selectbox('Folder', folders)
         files = list_files(folder)
-        with st.expander('Delete this folder', expanded=False):
-            st.write(f'Folder "{folder}" and the {len(files)} file(s) inside it will be deleted permanently.')
-            if st.checkbox('Yes, delete the whole folder', key=f'delf_{folder}'):
-                if st.button('Delete folder', key=f'delfbtn_{folder}'):
-                    delete_folder(folder)
-                    st.rerun()
         if not files:
             st.info('This folder is empty.')
             return
@@ -771,7 +804,7 @@ def page_view(topic, refresh):
                 notify_new_signal(topic, f"{st.session_state['creds']['client_id']}/{folder}/{f}", ev['last'])
 
         # ---- live status banner: shows the app is really running
-        now = dt.datetime.now()
+        now = now_ist().to_pydatetime()
         close_txt = strategies[0].get('close', '15:30')
         open_txt = '09:00' if strategies[0]['exchange'] == 'MCX' else '09:15'
         is_open = now.weekday() < 5 and open_txt <= now.strftime('%H:%M') <= close_txt
@@ -782,7 +815,7 @@ def page_view(topic, refresh):
                   ('market open' if is_open else 'market closed') + (' - running' if ok else ' - check warnings'), delta_color='off' if ok else 'inverse')
         b2.metric('Last refresh', now.strftime('%H:%M:%S'), f'next in {int(refresh)}s', delta_color='off')
         checks = [ev['checked'] for ev in evs.values() if ev.get('checked')]
-        b3.metric('Angel data checked', dt.datetime.fromtimestamp(max(checks)).strftime('%H:%M:%S') if checks else '-',
+        b3.metric('Angel data checked', ts_ist(max(checks)).strftime('%H:%M:%S') if checks else '-',
                   f'{len(evs)} / {len(files)} files OK', delta_color='off')
         n_sig = sum(int((ev['tr']['Signal'] != 'HOLD').sum()) for ev in evs.values() if not ev['tr'].empty)
         b4.metric('Signals since start', n_sig)
